@@ -63,6 +63,7 @@ local default_options = {
   ["trace"] = true,
   ["validate"] = true,
   ["emergency-gc"] = false,
+  ["doctor"] = false,
 
   -- Need this here to make the logger happy.
   ["log"] = "",
