@@ -229,6 +229,7 @@ namespace Legion {
                                        MappingCallInfo *info = NULL);
     public: // handling mapper calls
       void invoke_handle_message(Mapper::MapperMessage *message,
+                                 void *check_defer = NULL,
                                  MappingCallInfo *info = NULL);
       void invoke_handle_task_result(Mapper::MapperTaskResult *result,
                                      MappingCallInfo *info = NULL);
@@ -632,7 +633,10 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_MAPPER_CONTINUATION_TASK_ID;
       public:
-        MapperContinuation *continuation;
+        ContinuationArgs(UniqueID op_id, MapperContinuation *c)
+          : LgTaskArgs<ContinuationArgs>(op_id), continuation(c) { }
+      public:
+        MapperContinuation *const continuation;
       };
     public:
       MapperContinuation(MapperManager *manager,

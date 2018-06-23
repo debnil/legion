@@ -1155,6 +1155,13 @@ namespace Legion {
        * @param silence_warnings silence any warnings for this blocking call
        */
       bool is_empty(bool block = false, bool silence_warnings = false) const;
+      /**
+       * Check to see if the future is ready. This will return
+       * true if the future can be used without blocking to wait
+       * on the computation that the future represents, otherwise
+       * it will return false.
+       */
+      bool is_ready(void) const;
     public:
       /**
        * Return a const reference to the future.
@@ -2089,6 +2096,8 @@ namespace Legion {
       // These methods can only be accessed by the FieldAccessor class
       template<PrivilegeMode, typename, int, typename, typename, bool>
       friend class FieldAccessor;
+      template<typename, bool, int, typename, typename, bool>
+      friend class ReductionAccessor;
       template<typename, int, typename, typename>
       friend class UnsafeFieldAccessor;
       Realm::RegionInstance get_instance_info(PrivilegeMode mode, 
@@ -2113,31 +2122,31 @@ namespace Legion {
      * default version of this class is empty, but the following
      * specializations of this class with different privilege modes
      * will provide different methods specific to that privilege type
+     * The ReduceAccessor class should be used for explicit reductions
      *
      * READ_ONLY
      *  - FT read(const Point<N,T>&) const
      *  - const FT* ptr(const Point<N,T>&) const (Affine Accessor only)
      *  - const FT* ptr(const Rect<N,T>&) const (Affine Accessor only)
+     *  - FT* ptr(const Rect<N,T>&, size_t strides[N]) const (Affine only)
      *  - const FT& operator[](const Point<N,T>&) const (Affine Accessor only)
      *
      * READ_WRITE
      *  - FT read(const Point<N,T>&) const
      *  - void write(const Point<N,T>&, FT val) const
      *  - FT* ptr(const Point<N,T>&) const (Affine Accessor only)
-     *  - FT* ptr(const Rect<N,T>&) const (Affine Accessor only)
+     *  - FT* ptr(const Rect<N,T>&) const (Affine Accessor only, must be dense)
+     *  - FT* ptr(const Rect<N,T>&, size_t strides[N]) const (Affine only)
      *  - FT& operator[](const Point<N,T>&) const (Affine Accessor only)
-     *  - template<typename REDOP> void reduce(const Point<N,T>&, REDOP::RHS);
-     *    (Affine Accessor only)
+     *  - template<typename REDOP, bool EXCLUSIVE> 
+     *      void reduce(const Point<N,T>&, REDOP::RHS); (Affine Accessor only)
      *
      *  WRITE_DISCARD
      *  - void write(const Point<N,T>&, FT val) const
      *  - FT* ptr(const Point<N,T>&) const (Affine Accessor only)
      *  - FT* ptr(const Rect<N,T>&) const (Affine Accessor only)
+     *  - FT* ptr(const Rect<N,T>&, size_t strides[N]) const (Affine only)
      *  - FT& operator[](const Point<N,T>&) const (Affine Accessor only)
-     *
-     * REDUCE
-     *  - template<typename REDOP> void reduce(const Point<N,T>&, REDOP::RHS)
-     *    (Affine Accessor only)
      */
     template<PrivilegeMode MODE, typename FT, int N, typename COORD_T = coord_t,
              typename A = Realm::GenericAccessor<FT,N,COORD_T>,
@@ -2201,6 +2210,114 @@ namespace Legion {
                     bool check_field_size = false,
 #endif
                     bool silence_warnings = false) { }
+    };
+
+    /**
+     * \class ReductionAccessor
+     * A field accessor is a class used to perform reductions to a given
+     * field inside a PhysicalRegion object for a specific field. Reductions
+     * can be performed directly or array indexing can be used along with 
+     * the <<= operator to perform the reduction. We also provide the same
+     * variants of the 'ptr' method as normal accessors to obtain a pointer 
+     * to the underlying allocation. This seems to be useful when we need
+     * to do reductions directly to a buffer as is often necessary when
+     * invoking external libraries like BLAS.
+     * This method currently only works with the Realm::AffineAccessor layout
+     */
+    template<typename REDOP, bool EXCLUSIVE, int N, typename COORD_T = coord_t,
+             typename A = Realm::GenericAccessor<typename REDOP::RHS,N,COORD_T>,
+#ifdef BOUNDS_CHECKS
+             bool CHECK_BOUNDS = true>
+#else
+             bool CHECK_BOUNDS = false>
+#endif
+    class ReductionAccessor {
+    public:
+      ReductionAccessor(void) { }
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop, bool silence_warnings = false) { }
+      // For Realm::AffineAccessor specializations there are additional
+      // methods for creating accessors with limited bounding boxes and
+      // affine transformations for using alternative coordinates spaces
+      // Specify a specific bounds rectangle to use for the accessor
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop, 
+                        const Rect<N,COORD_T> bounds,
+                        bool silence_warnings = false) { }
+      // Specify a specific Affine transform to use for interpreting points
+      template<int M>
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop,
+                        const AffineTransform<M,N,COORD_T> transform,
+                        bool silence_warnings = false) { }
+      // Specify both a transform and a bounds to use
+      template<int M>
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop,
+                        const AffineTransform<M,N,COORD_T> transform,
+                        const Rect<N,COORD_T> bounds,
+                        bool silence_warnings = false) { }
+    };
+
+    /**
+     * \class DeferredValue
+     * A deferred value is a special helper class for handling return values 
+     * for tasks that do asynchronous operations (e.g. GPU kernel launches), 
+     * but we don't want to wait for the asynchronous operations to be returned. 
+     * This object should be returned directly as the result of a Legion task, 
+     * but its value will not be read until all of the "effects" of the task 
+     * are done. It is important that this object be returned from the task in
+     * order to ensure its memory is cleaned up. Not returning any created
+     * DeferredValue objects will result in a memory leak. It supports the 
+     * following methods during task execution:
+     *  - T read(void) const
+     *  - void write(T val) const
+     *  - T* ptr(void) const
+     *  - T& operator(void) const
+     */
+    template<typename T>
+    class DeferredValue {
+    public:
+      DeferredValue(T initial_value);
+    public:
+      __CUDA_HD__
+      inline T read(void) const;
+      __CUDA_HD__
+      inline void write(T value);
+      __CUDA_HD__
+      inline T* ptr(void);
+      __CUDA_HD__
+      inline T& ref(void);
+      __CUDA_HD__
+      inline operator T(void) const;
+      __CUDA_HD__
+      inline DeferredValue<T>& operator=(T value);
+    public:
+      inline void finalize(InternalContext ctx) const;
+    protected:
+      Realm::RegionInstance instance;
+      Realm::AffineAccessor<T,1,coord_t> accessor;
+    };
+
+    /**
+     * \class DeferredReduction 
+     * This is a special case of a DeferredValue that also supports
+     * a reduction operator. It should be returned directly as the
+     * result of a Legion task. It supports all the same methods
+     * as the DeferredValue as well as an additional method for
+     * doing reductions using a reduction operator.
+     *  - void reduce(REDOP::RHS val)
+     *  - void <<=(REDOP::RHS val)
+     */
+    template<typename REDOP, bool EXCLUSIVE=false>
+    class DeferredReduction: public DeferredValue<typename REDOP::RHS> {
+    public:
+      DeferredReduction(void);
+    public:
+      __CUDA_HD__
+      inline void reduce(typename REDOP::RHS val);
+      __CUDA_HD__
+      inline void operator<<=(typename REDOP::RHS val);
     };
  
     //==========================================================================
@@ -4383,12 +4500,14 @@ namespace Legion {
        * @return handle for the logical region created
        */
       LogicalRegion create_logical_region(Context ctx, IndexSpace index, 
-                                          FieldSpace fields);
+                                          FieldSpace fields,
+                                          bool task_local = false);
       // Template version
       template<int DIM, typename COORD_T>
       LogicalRegionT<DIM,COORD_T> create_logical_region(Context ctx,
                                       IndexSpaceT<DIM,COORD_T> index,
-                                      FieldSpace fields);
+                                      FieldSpace fields,
+                                      bool task_local = false);
       /**
        * Destroy a logical region and all of its logical sub-regions.
        * @param ctx enclosing task context
@@ -5068,8 +5187,9 @@ namespace Legion {
        * Detach an external resource from a logical region
        * @param ctx enclosing task context
        * @param the physical region for the external resource
+       * @return an empty future indicating when the resource is detached
        */
-      void detach_external_resource(Context ctx, PhysicalRegion region);
+      Future detach_external_resource(Context ctx, PhysicalRegion region);
 
       /**
        * @deprecated
@@ -6029,6 +6149,18 @@ namespace Legion {
       MapperID generate_dynamic_mapper_id(void);
 
       /**
+       * Generate a contiguous set of MapperIDs for use by a library.
+       * This call will always generate the same answer for the same library
+       * name no many how many times it is called or on how many nodes it
+       * is called. If the count passed in to this method differs for the 
+       * same library name the runtime will raise an error.
+       * @param name a unique null-terminated string that names the library
+       * @param count the number of mapper IDs that should be generated
+       * @return the first mapper ID that is allocated to the library
+       */
+      MapperID generate_library_mapper_ids(const char *name, size_t count);
+
+      /**
        * Statically generate a unique Mapper ID for use across the machine.
        * This can only be called prior to the runtime starting. It must
        * be invoked symmetrically across all nodes in the machine prior
@@ -6071,6 +6203,19 @@ namespace Legion {
        * @reutrn a ProjectionID that is globally unique across the machine
        */
       ProjectionID generate_dynamic_projection_id(void);
+
+      /** 
+       * Generate a contiguous set of ProjectionIDs for use by a library.
+       * This call will always generate the same answer for the same library
+       * name no many how many times it is called or on how many nodes it
+       * is called. If the count passed in to this method differs for the 
+       * same library name the runtime will raise an error.
+       * @param name a unique null-terminated string that names the library
+       * @param count the number of projection IDs that should be generated
+       * @return the first projection ID that is allocated to the library
+       */
+      ProjectionID generate_library_projection_ids(const char *name, 
+                                                   size_t count);
 
       /**
        * Statically generate a unique Projection ID for use across the machine.
@@ -6143,6 +6288,9 @@ namespace Legion {
        * -lg:sched <int> The run-ahead factor for the runtime.  How many
        *              outstanding tasks ready to run should be on each
        *              processor before backing off the mapping procedure.
+       * -lg:vector <int> Set the initial vectorization option for fusing
+       *              together important runtime meta tasks in the mapper.
+       *              The default is 16.
        * -lg:inorder  Execute operations in strict propgram order. This
        *              flag will actually run the entire operation through
        *              the pipeline and wait for it to complete before
@@ -6487,6 +6635,18 @@ namespace Legion {
        * @return a Task ID that is globally unique across the machine
        */
       TaskID generate_dynamic_task_id(void);
+
+      /**
+       * Generate a contiguous set of TaskIDs for use by a library.
+       * This call will always generate the same answer for the same library
+       * name no many how many times it is called or on how many nodes it
+       * is called. If the count passed in to this method differs for the 
+       * same library name the runtime will raise an error.
+       * @param name a unique null-terminated string that names the library
+       * @param count the number of task IDs that should be generated
+       * @return the first task ID that is allocated to the library
+       */
+      TaskID generate_library_task_ids(const char *name, size_t count);
 
       /**
        * Statically generate a unique Task ID for use across the machine.

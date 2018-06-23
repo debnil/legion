@@ -34,14 +34,6 @@ namespace Legion {
     class TaskContext : public ContextInterface, 
                         public ResourceTracker, public Collectable {
     public:
-      struct PostEndArgs : public LgTaskArgs<PostEndArgs> {
-      public:
-        static const LgTaskID TASK_ID = LG_POST_END_ID;
-      public:
-        TaskContext *proxy_this;
-        void *result;
-        size_t result_size;
-      };
       class AutoRuntimeCall {
       public:
         AutoRuntimeCall(TaskContext *c) : ctx(c) { ctx->begin_runtime_call(); }
@@ -254,7 +246,8 @@ namespace Legion {
                                const std::set<FieldID> &to_free) = 0; 
       virtual LogicalRegion create_logical_region(RegionTreeForest *forest,
                                             IndexSpace index_space,
-                                            FieldSpace field_space) = 0;
+                                            FieldSpace field_space,
+                                            bool task_local) = 0;
       virtual void destroy_logical_region(LogicalRegion handle) = 0;
       virtual void destroy_logical_partition(LogicalPartition handle) = 0;
       virtual FieldAllocator create_field_allocator(Legion::Runtime *external,
@@ -276,7 +269,7 @@ namespace Legion {
       virtual void issue_release(const ReleaseLauncher &launcher) = 0;
       virtual PhysicalRegion attach_resource(
                                   const AttachLauncher &launcher) = 0;
-      virtual void detach_resource(PhysicalRegion region) = 0;
+      virtual Future detach_resource(PhysicalRegion region) = 0;
       virtual FutureMap execute_must_epoch(
                                  const MustEpochLauncher &launcher) = 0;
       virtual Future issue_timing_measurement(
@@ -297,19 +290,24 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                const std::vector<StaticDependence> *dependences) = 0;
       virtual unsigned register_new_close_operation(CloseOp *op) = 0;
-      virtual void add_to_dependence_queue(Operation *op,
-                                           RtEvent op_precondition) = 0;
+      virtual void add_to_prepipeline_queue(Operation *op) = 0;
+      virtual void add_to_dependence_queue(Operation *op) = 0;
+      virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
+          const void *result, size_t size, PhysicalInstance instance) = 0;
       virtual void register_child_executed(Operation *op) = 0;
       virtual void register_child_complete(Operation *op) = 0;
       virtual void register_child_commit(Operation *op) = 0; 
       virtual void unregister_child_operation(Operation *op) = 0;
       virtual ApEvent register_fence_dependence(Operation *op) = 0;
-#ifdef LEGION_SPY
-      virtual ApEvent get_fence_precondition(void) const = 0;
-#endif
     public:
-      virtual void perform_fence_analysis(FenceOp *op) = 0;
-      virtual void update_current_fence(FenceOp *op) = 0;
+      // Break this into two pieces since we know that there are some
+      // kinds of operations (like deletions) that want to act like 
+      // one-sided fences (e.g. waiting on everything before) but not
+      // preventing re-ordering for things afterwards
+      virtual ApEvent perform_fence_analysis(Operation *op, 
+                                             bool mapping, bool execution) = 0;
+      virtual void update_current_fence(FenceOp *op, 
+                                        bool mapping, bool execution) = 0;
     public:
       virtual void begin_trace(TraceID tid) = 0;
       virtual void end_trace(TraceID tid) = 0;
@@ -353,16 +351,15 @@ namespace Legion {
     public:
       virtual InstanceView* create_instance_top_view(PhysicalManager *manager,
                              AddressSpaceID source, RtEvent *ready = NULL) = 0;
-      static void handle_remote_view_creation(const void *args);
-      static void handle_create_top_view_request(Deserializer &derez, 
-                            Runtime *runtime, AddressSpaceID source);
-      static void handle_create_top_view_response(Deserializer &derez,
-                                                   Runtime *runtime);
     public:
-      virtual const std::vector<PhysicalRegion>& begin_task(void);
-      virtual void end_task(const void *res, size_t res_size, bool owned) = 0;
+      virtual const std::vector<PhysicalRegion>& begin_task(
+                                                   Legion::Runtime *&runtime);
+      virtual void end_task(const void *res, size_t res_size, bool owned,
+                    PhysicalInstance inst = PhysicalInstance::NO_INST) = 0;
       virtual void post_end_task(const void *res, 
                                  size_t res_size, bool owned) = 0;
+      void begin_misspeculation(void);
+      void end_misspeculation(const void *res, size_t res_size);
     public:
       virtual void add_acquisition(AcquireOp *op, 
                                    const RegionRequirement &req) = 0;
@@ -388,12 +385,12 @@ namespace Legion {
       PhysicalRegion get_physical_region(unsigned idx);
       void get_physical_references(unsigned idx, InstanceSet &refs);
     public:
-      void add_created_region(LogicalRegion handle);
+      void add_created_region(LogicalRegion handle, bool task_local);
       // for logging created region requirements
       void log_created_requirements(void);
     public: // Privilege tracker methods
       virtual void register_region_creations(
-                          const std::set<LogicalRegion> &regions);
+                     const std::map<LogicalRegion,bool> &regions);
       virtual void register_region_deletions(
                           const std::set<LogicalRegion> &regions);
     public:
@@ -417,7 +414,7 @@ namespace Legion {
       virtual void register_index_partition_deletions(
                           const std::set<IndexPartition> &parts);
     public:
-      void register_region_creation(LogicalRegion handle);
+      void register_region_creation(LogicalRegion handle, bool task_local);
       void register_region_deletion(LogicalRegion handle);
     public:
       void register_field_creation(FieldSpace space, FieldID fid, bool local);
@@ -528,6 +525,10 @@ namespace Legion {
       // Application tasks can manipulate these next two data
       // structures by creating regions and fields, make sure you are
       // holding the operation lock when you are accessing them
+      // We use a region requirement with an empty privilege_fields
+      // set to indicate regions on which we have privileges for 
+      // all fields because this is a created region instead of
+      // a created field.
       std::deque<RegionRequirement>             created_requirements;
       // Track whether the created region requirements have
       // privileges to be returned or not
@@ -575,13 +576,66 @@ namespace Legion {
 
     class InnerContext : public TaskContext {
     public:
-      struct DeferredDependenceArgs : 
-        public LgTaskArgs<DeferredDependenceArgs> {
+      // Prepipeline stages need to hold a reference since the
+      // logical analysis could clean the context up before it runs
+      struct PrepipelineArgs : public LgTaskArgs<PrepipelineArgs> {
+      public:
+        static const LgTaskID TASK_ID = LG_PRE_PIPELINE_ID;
+      public:
+        PrepipelineArgs(Operation *op, InnerContext *ctx)
+          : LgTaskArgs<PrepipelineArgs>(op->get_unique_op_id()),
+            context(ctx) { ctx->add_reference(); }
+      public:
+        InnerContext *const context;
+      };
+      struct DependenceArgs : public LgTaskArgs<DependenceArgs> {
       public:
         static const LgTaskID TASK_ID = LG_TRIGGER_DEPENDENCE_ID;
       public:
-        Operation *op;
-      }; 
+        DependenceArgs(Operation *op, InnerContext *ctx)
+          : LgTaskArgs<DependenceArgs>(op->get_unique_op_id()), 
+            context(ctx) { }
+      public:
+        InnerContext *const context;
+      };
+      struct PostEndArgs : public LgTaskArgs<PostEndArgs> {
+      public:
+        static const LgTaskID TASK_ID = LG_POST_END_ID;
+      public:
+        PostEndArgs(TaskOp *owner, InnerContext *ctx)
+          : LgTaskArgs<PostEndArgs>(owner->get_unique_op_id()),
+            proxy_this(ctx) { }
+      public:
+        InnerContext *const proxy_this;
+      };
+      struct PostTaskArgs {
+      public:
+        PostTaskArgs(TaskContext *ctx, const void *r, size_t s, 
+                     PhysicalInstance i, RtEvent w)
+          : context(ctx), result(r), size(s), instance(i), wait_on(w) { }
+      public:
+        TaskContext *context;
+        const void *result;
+        size_t size;
+        PhysicalInstance instance;
+        RtEvent wait_on;
+      };
+      struct DeferredPostTaskArgs : public LgTaskArgs<DeferredPostTaskArgs> {
+      public:
+        static const LgTaskID TASK_ID = LG_DEFERRED_POST_END_ID;
+      public:
+        DeferredPostTaskArgs(const PostTaskArgs &a, RtUserEvent s)
+          : LgTaskArgs<DeferredPostTaskArgs>(
+              a.context->owner_task->get_unique_op_id()),
+            context(a.context), result(a.result), size(a.size),
+            instance(a.instance), started(s) { }
+      public:
+        TaskContext *context;
+        const void *result;
+        const size_t size;
+        PhysicalInstance instance;
+        RtUserEvent started;
+      };
       struct PostDecrementArgs : public LgTaskArgs<PostDecrementArgs> {
       public:
         static const LgTaskID TASK_ID = LG_POST_DECREMENT_TASK_ID;
@@ -592,9 +646,14 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_ISSUE_FRAME_TASK_ID;
       public:
-        InnerContext *parent_ctx;
-        FrameOp *frame;
-        ApEvent frame_termination;
+        IssueFrameArgs(TaskOp *owner, InnerContext *ctx,
+                       FrameOp *f, ApEvent term)
+          : LgTaskArgs<IssueFrameArgs>(owner->get_unique_op_id()),
+            parent_ctx(ctx), frame(f), frame_termination(term) { }
+      public:
+        InnerContext *const parent_ctx;
+        FrameOp *const frame;
+        const ApEvent frame_termination;
       };
       struct RemoteCreateViewArgs : public LgTaskArgs<RemoteCreateViewArgs> {
       public:
@@ -814,7 +873,8 @@ namespace Legion {
                                const std::set<FieldID> &to_free);
       virtual LogicalRegion create_logical_region(RegionTreeForest *forest,
                                             IndexSpace index_space,
-                                            FieldSpace field_space);
+                                            FieldSpace field_space,
+                                            bool task_local);
       virtual void destroy_logical_region(LogicalRegion handle);
       virtual void destroy_logical_partition(LogicalPartition handle);
       virtual FieldAllocator create_field_allocator(Legion::Runtime *external,
@@ -834,7 +894,7 @@ namespace Legion {
       virtual void issue_acquire(const AcquireLauncher &launcher);
       virtual void issue_release(const ReleaseLauncher &launcher);
       virtual PhysicalRegion attach_resource(const AttachLauncher &launcher);
-      virtual void detach_resource(PhysicalRegion region);
+      virtual Future detach_resource(PhysicalRegion region);
       virtual FutureMap execute_must_epoch(const MustEpochLauncher &launcher);
       virtual Future issue_timing_measurement(const TimingLauncher &launcher);
       virtual void issue_mapping_fence(void);
@@ -853,19 +913,23 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                 const std::vector<StaticDependence> *dependences);
       virtual unsigned register_new_close_operation(CloseOp *op);
-      virtual void add_to_dependence_queue(Operation *op,
-                                           RtEvent op_precondition);
+      virtual void add_to_prepipeline_queue(Operation *op);
+      void process_prepipeline_stage(void);
+      virtual void add_to_dependence_queue(Operation *op);
+      void process_dependence_stage(void);
+      virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
+          const void *result, size_t size, PhysicalInstance instance);
+      void process_post_end_tasks(void);
       virtual void register_child_executed(Operation *op);
       virtual void register_child_complete(Operation *op);
       virtual void register_child_commit(Operation *op); 
       virtual void unregister_child_operation(Operation *op);
       virtual ApEvent register_fence_dependence(Operation *op);
-#ifdef LEGION_SPY
-      virtual ApEvent get_fence_precondition(void) const;
-#endif
     public:
-      virtual void perform_fence_analysis(FenceOp *op);
-      virtual void update_current_fence(FenceOp *op);
+      virtual ApEvent perform_fence_analysis(Operation *op,
+                                          bool mapping, bool execution);
+      virtual void update_current_fence(FenceOp *op,
+                                        bool mapping, bool execution);
     public:
       virtual void begin_trace(TraceID tid);
       virtual void end_trace(TraceID tid);
@@ -884,7 +948,6 @@ namespace Legion {
       virtual RtEvent decrement_pending(bool need_deferral);
       virtual void increment_frame(void);
       virtual void decrement_frame(void);
-    
     public:
       virtual InnerContext* find_parent_logical_context(unsigned index);
       virtual InnerContext* find_parent_physical_context(unsigned index,
@@ -917,8 +980,10 @@ namespace Legion {
       static void handle_create_top_view_response(Deserializer &derez,
                                                    Runtime *runtime);
     public:
-      virtual const std::vector<PhysicalRegion>& begin_task(void);
-      virtual void end_task(const void *res, size_t res_size, bool owned);
+      virtual const std::vector<PhysicalRegion>& begin_task(
+                                                    Legion::Runtime *&runtime);
+      virtual void end_task(const void *res, size_t res_size, bool owned,
+                            PhysicalInstance inst = PhysicalInstance::NO_INST);
       virtual void post_end_task(const void *res, size_t res_size, bool owned);
     public:
       virtual void add_acquisition(AcquireOp *op, 
@@ -948,6 +1013,11 @@ namespace Legion {
                                           AddressSpaceID result);
       static void handle_version_owner_response(Deserializer &derez,
                                                 Runtime *runtime);
+    public:
+      static void handle_prepipeline_stage(const void *args);
+      static void handle_dependence_stage(const void *args);
+      static void handle_post_end_task(const void *args);
+      static void handle_deferred_post_end_task(const void *args);
     public:
       void free_remote_contexts(void);
       void send_remote_context(AddressSpaceID remote_instance, 
@@ -990,20 +1060,32 @@ namespace Legion {
       std::map<unsigned,Operation*> outstanding_children;
 #endif
 #ifdef LEGION_SPY
+      // Some help for Legion Spy for validating fences
       std::deque<UniqueID> ops_since_last_fence;
+      std::set<ApEvent> previous_completion_events;
 #endif
+    protected: // Queues for fusing together small meta-tasks
+      mutable LocalLock                               prepipeline_lock;
+      std::deque<std::pair<Operation*,GenerationID> > prepipeline_queue;
+      unsigned                                        outstanding_prepipeline;
+    protected:
+      mutable LocalLock                               dependence_lock;
+      std::deque<Operation*>                          dependence_queue;
+      RtEvent                                         dependence_precondition;
+      // Only one of these ever to keep things in order
+      bool                                            outstanding_dependence;
+    protected:
+      mutable LocalLock                               post_task_lock;
+      std::list<PostTaskArgs>                         post_task_queue;
+      unsigned                                        outstanding_post_task;
     protected:
       // Traces for this task's execution
       LegionMap<TraceID,DynamicTrace*,TASK_TRACES_ALLOC>::tracked traces;
       LegionTrace *current_trace;
-      // Event for waiting when the number of mapping+executing
-      // child operations has grown too large.
-      mutable LocalLock window_lock;
       bool valid_wait_event;
       RtUserEvent window_wait;
       std::deque<ApEvent> frame_events;
       RtEvent last_registration;
-      RtEvent dependence_precondition;
     protected:
       // Our cached set of index spaces for immediate domains
       std::map<Domain,IndexSpace> index_launch_spaces;
@@ -1020,10 +1102,11 @@ namespace Legion {
       // indicating that it is no longer far enough ahead
       bool currently_active_context;
     protected:
-      FenceOp *current_fence;
-      GenerationID fence_gen;
-      ApEvent current_fence_event;
-      unsigned current_fence_index;
+      FenceOp *current_mapping_fence;
+      GenerationID mapping_fence_gen;
+      unsigned current_mapping_fence_index;
+      ApEvent current_execution_fence_event;
+      unsigned current_execution_fence_index;
     protected:
       // For managing changing task priorities
       ApEvent realm_done_event;
@@ -1051,11 +1134,9 @@ namespace Legion {
       // Track information for locally allocated fields
       mutable LocalLock                                 local_field_lock;
       std::map<FieldSpace,std::vector<LocalFieldInfo> > local_fields;
-#ifdef LEGION_SPY
-      // Some help for Legion Spy for validating execution fences
     protected:
-      std::set<ApEvent> previous_completion_events;
-#endif
+      // Track information for locally created regions
+      std::set<LogicalRegion> local_regions;
     };
 
     /**
@@ -1082,6 +1163,9 @@ namespace Legion {
       virtual InnerContext* find_outermost_local_context(
                           InnerContext *previous = NULL);
       virtual InnerContext* find_top_context(void);
+      // Have a special implementation here to avoid a shutdown race
+      virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
+                     const void *result, size_t size, PhysicalInstance inst);
     public:
       virtual VersionInfo& get_version_info(unsigned idx);
       virtual const std::vector<VersionInfo>* get_version_infos(void);
@@ -1394,7 +1478,8 @@ namespace Legion {
                                const std::set<FieldID> &to_free);
       virtual LogicalRegion create_logical_region(RegionTreeForest *forest,
                                             IndexSpace index_space,
-                                            FieldSpace field_space);
+                                            FieldSpace field_space,
+                                            bool task_local);
       virtual void destroy_logical_region(LogicalRegion handle);
       virtual void destroy_logical_partition(LogicalPartition handle);
       virtual FieldAllocator create_field_allocator(Legion::Runtime *external,
@@ -1414,7 +1499,7 @@ namespace Legion {
       virtual void issue_acquire(const AcquireLauncher &launcher);
       virtual void issue_release(const ReleaseLauncher &launcher);
       virtual PhysicalRegion attach_resource(const AttachLauncher &launcher);
-      virtual void detach_resource(PhysicalRegion region);
+      virtual Future detach_resource(PhysicalRegion region);
       virtual FutureMap execute_must_epoch(const MustEpochLauncher &launcher);
       virtual Future issue_timing_measurement(const TimingLauncher &launcher);
       virtual void issue_mapping_fence(void);
@@ -1433,19 +1518,20 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                 const std::vector<StaticDependence> *dependences);
       virtual unsigned register_new_close_operation(CloseOp *op);
-      virtual void add_to_dependence_queue(Operation *op,
-                                           RtEvent op_precondition);
+      virtual void add_to_prepipeline_queue(Operation *op);
+      virtual void add_to_dependence_queue(Operation *op);
+      virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
+          const void *result, size_t size, PhysicalInstance instance);
       virtual void register_child_executed(Operation *op);
       virtual void register_child_complete(Operation *op);
       virtual void register_child_commit(Operation *op); 
       virtual void unregister_child_operation(Operation *op);
       virtual ApEvent register_fence_dependence(Operation *op);
-#ifdef LEGION_SPY
-      virtual ApEvent get_fence_precondition(void) const;
-#endif
     public:
-      virtual void perform_fence_analysis(FenceOp *op);
-      virtual void update_current_fence(FenceOp *op);
+      virtual ApEvent perform_fence_analysis(Operation *op,
+                                             bool mapping, bool execution);
+      virtual void update_current_fence(FenceOp *op,
+                                        bool mapping, bool execution);
     public:
       virtual void begin_trace(TraceID tid);
       virtual void end_trace(TraceID tid);
@@ -1485,13 +1571,9 @@ namespace Legion {
     public:
       virtual InstanceView* create_instance_top_view(PhysicalManager *manager,
                              AddressSpaceID source, RtEvent *ready = NULL);
-      static void handle_remote_view_creation(const void *args);
-      static void handle_create_top_view_request(Deserializer &derez, 
-                            Runtime *runtime, AddressSpaceID source);
-      static void handle_create_top_view_response(Deserializer &derez,
-                                                   Runtime *runtime);
     public:
-      virtual void end_task(const void *res, size_t res_size, bool owned);
+      virtual void end_task(const void *res, size_t res_size, bool owned,
+                            PhysicalInstance inst = PhysicalInstance::NO_INST);
       virtual void post_end_task(const void *res, size_t res_size, bool owned);
     public:
       virtual void add_acquisition(AcquireOp *op, 
@@ -1706,7 +1788,8 @@ namespace Legion {
                                const std::set<FieldID> &to_free);
       virtual LogicalRegion create_logical_region(RegionTreeForest *forest,
                                             IndexSpace index_space,
-                                            FieldSpace field_space);
+                                            FieldSpace field_space,
+                                            bool task_local);
       virtual void destroy_logical_region(LogicalRegion handle);
       virtual void destroy_logical_partition(LogicalPartition handle);
       virtual FieldAllocator create_field_allocator(Legion::Runtime *external,
@@ -1726,7 +1809,7 @@ namespace Legion {
       virtual void issue_acquire(const AcquireLauncher &launcher);
       virtual void issue_release(const ReleaseLauncher &launcher);
       virtual PhysicalRegion attach_resource(const AttachLauncher &launcher);
-      virtual void detach_resource(PhysicalRegion region);
+      virtual Future detach_resource(PhysicalRegion region);
       virtual FutureMap execute_must_epoch(const MustEpochLauncher &launcher);
       virtual Future issue_timing_measurement(const TimingLauncher &launcher);
       virtual void issue_mapping_fence(void);
@@ -1745,19 +1828,20 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                 const std::vector<StaticDependence> *dependences);
       virtual unsigned register_new_close_operation(CloseOp *op);
-      virtual void add_to_dependence_queue(Operation *op,
-                                           RtEvent op_precondition);
+      virtual void add_to_prepipeline_queue(Operation *op);
+      virtual void add_to_dependence_queue(Operation *op);
+      virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
+          const void *result, size_t size, PhysicalInstance instance);
       virtual void register_child_executed(Operation *op);
       virtual void register_child_complete(Operation *op);
       virtual void register_child_commit(Operation *op); 
       virtual void unregister_child_operation(Operation *op);
       virtual ApEvent register_fence_dependence(Operation *op);
-#ifdef LEGION_SPY
-      virtual ApEvent get_fence_precondition(void) const;
-#endif
     public:
-      virtual void perform_fence_analysis(FenceOp *op);
-      virtual void update_current_fence(FenceOp *op);
+      virtual ApEvent perform_fence_analysis(Operation *op,
+                                             bool mapping, bool execution);
+      virtual void update_current_fence(FenceOp *op,
+                                        bool mapping, bool execution);
     public:
       virtual void begin_trace(TraceID tid);
       virtual void end_trace(TraceID tid);
@@ -1798,14 +1882,11 @@ namespace Legion {
     public:
       virtual InstanceView* create_instance_top_view(PhysicalManager *manager,
                              AddressSpaceID source, RtEvent *ready = NULL);
-      static void handle_remote_view_creation(const void *args);
-      static void handle_create_top_view_request(Deserializer &derez, 
-                            Runtime *runtime, AddressSpaceID source);
-      static void handle_create_top_view_response(Deserializer &derez,
-                                                   Runtime *runtime);
     public:
-      virtual const std::vector<PhysicalRegion>& begin_task(void);
-      virtual void end_task(const void *res, size_t res_size, bool owned);
+      virtual const std::vector<PhysicalRegion>& begin_task(
+                                                    Legion::Runtime *&runtime);
+      virtual void end_task(const void *res, size_t res_size, bool owned,
+                            PhysicalInstance inst = PhysicalInstance::NO_INST);
       virtual void post_end_task(const void *res, size_t res_size, bool owned);
     public:
       virtual void add_acquisition(AcquireOp *op, 

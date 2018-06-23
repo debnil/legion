@@ -1173,14 +1173,21 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     void MapperManager::invoke_handle_message(Mapper::MapperMessage *message,
-                                              MappingCallInfo *info)
+                                       void *check_defer, MappingCallInfo *info)
     //--------------------------------------------------------------------------
     {
       if (info == NULL)
       {
         // Special case for handle message, always defer it if we are also
-        // the sender in order to avoid deadlocks
-        if (message->sender == processor)
+        // the sender in order to avoid deadlocks, same thing for any
+        // local processor for non-reentrant mappers, have to use a test
+        // for NULL pointer here since mapper continuation want
+        // pointer arguments
+        if ((check_defer == NULL) && 
+            ((message->sender == processor) ||
+             ((mapper->get_mapper_sync_model() == 
+               Mapper::SERIALIZED_NON_REENTRANT_MAPPER_MODEL) && 
+              runtime->is_local(message->sender))))
         {
           defer_message(message);
           return;
@@ -1190,9 +1197,9 @@ namespace Legion {
                                  NULL, continuation_precondition);
         if (continuation_precondition.exists())
         {
-          MapperContinuation1<Mapper::MapperMessage,
+          MapperContinuation2<Mapper::MapperMessage, void,
                               &MapperManager::invoke_handle_message>
-                                continuation(this, message, info);
+                                continuation(this, message, info, info);
           continuation.defer(runtime, continuation_precondition);
           return;
         }
@@ -1295,7 +1302,7 @@ namespace Legion {
       RtEvent ready;
       instance.impl = runtime->find_or_request_physical_manager(did, ready);
       if (ready.exists())
-        ready.lg_wait();
+        ready.wait();
       resume_mapper_call(ctx);
     }
 
@@ -1341,7 +1348,7 @@ namespace Legion {
       pause_mapper_call(ctx);
       RtEvent wait_on = event.impl;
       if (wait_on.exists())
-        wait_on.lg_wait();
+        wait_on.wait();
       resume_mapper_call(ctx);
     }
 
@@ -1913,8 +1920,7 @@ namespace Legion {
           ctx->acquired_instances->end())
         return true;
       pause_mapper_call(ctx);
-      if (manager->try_add_base_valid_ref(MAPPING_ACQUIRE_REF, ctx->operation,
-                                          !manager->is_owner()))
+      if (manager->acquire_instance(MAPPING_ACQUIRE_REF, ctx->operation))
       {
         record_acquired_instance(ctx, manager, false/*created*/);
         resume_mapper_call(ctx);
@@ -1931,7 +1937,7 @@ namespace Legion {
       RtEvent wait_on = 
         manager->memory_manager->acquire_instances(instances, results);
       if (wait_on.exists())
-        wait_on.lg_wait(); // wait for the results to be ready
+        wait_on.wait(); // wait for the results to be ready
       bool success = results[0];
       if (success)
         record_acquired_instance(ctx, manager, false/*created*/);
@@ -2031,6 +2037,7 @@ namespace Legion {
             instances.erase(instances.begin()+(*it));
         }
       }
+      resume_mapper_call(ctx);
       return (local_acquired && remote_acquired);
     }
 
@@ -2153,8 +2160,7 @@ namespace Legion {
         // Try to add an acquired reference immediately
         // If we're remote it has to be valid already to be sound, but if
         // we're local whatever works
-        if (manager->try_add_base_valid_ref(MAPPING_ACQUIRE_REF, 
-                                info->operation, !manager->is_owner()))
+        if (manager->acquire_instance(MAPPING_ACQUIRE_REF, info->operation))
         {
           // We already know it wasn't there before
           already_acquired[manager] = std::pair<unsigned,bool>(1, false);
@@ -2192,7 +2198,7 @@ namespace Legion {
       if (!done_events.empty())
       {
         RtEvent ready = Runtime::merge_events(done_events);
-        ready.lg_wait();
+        ready.wait();
       }
       // Now find out which ones we acquired and which ones didn't
       bool all_acquired = true;
@@ -2205,15 +2211,8 @@ namespace Legion {
               req_it->second.instances.end(); it++, idx++)
         {
           if (req_it->second.results[idx])
-          {
             // record that we acquired it
             record_acquired_instance(info, *it, false/*created*/); 
-            // make the reference a local reference and 
-            // remove our remote did reference
-            (*it)->add_base_valid_ref(MAPPING_ACQUIRE_REF, info->operation);
-            (*it)->send_remote_valid_update(req_it->first->owner_space, NULL,
-                                            1, false/*add*/);
-          }
           else
             all_acquired = false;
         }
@@ -3107,7 +3106,7 @@ namespace Legion {
       message.message = margs->message;
       message.size = margs->size;
       message.broadcast = margs->broadcast;
-      margs->manager->invoke_handle_message(&message);
+      margs->manager->invoke_handle_message(&message, &message/*non-NULL*/);
       // Then free up the allocated memory
       free(margs->message);
     }
@@ -3277,7 +3276,7 @@ namespace Legion {
           RtUserEvent ready_event = Runtime::create_rt_user_event();
           info->resume = ready_event;
           non_reentrant_calls.push_back(info);
-          ready_event.lg_wait();
+          ready_event.wait();
           // When we wake up, we should be non-reentrant
 #ifdef DEBUG_LEGION
           assert(!permit_reentrant);
@@ -3379,7 +3378,7 @@ namespace Legion {
           executing_call = info;
       }
       if (wait_on.exists())
-        wait_on.lg_wait();
+        wait_on.wait();
 #ifdef DEBUG_LEGION
       assert(executing_call == info);
 #endif
@@ -3581,7 +3580,7 @@ namespace Legion {
         }
       }
       if (wait_on.exists())
-        wait_on.lg_wait();
+        wait_on.wait();
     }
 
     //--------------------------------------------------------------------------
@@ -3743,12 +3742,12 @@ namespace Legion {
                                    Operation *op)
     //--------------------------------------------------------------------------
     {
-      ContinuationArgs args;
-      args.continuation = this;
+      ContinuationArgs args((op == NULL) ? task_profiling_provenance :
+                              op->get_unique_op_id(), this);
       // Give this resource priority in case we are holding the mapper lock
       RtEvent wait_on = runtime->issue_runtime_meta_task(args,
-                         LG_RESOURCE_PRIORITY, op, precondition);
-      wait_on.lg_wait();
+                           LG_RESOURCE_PRIORITY, precondition);
+      wait_on.wait();
     }
 
     //--------------------------------------------------------------------------

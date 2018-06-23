@@ -231,6 +231,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_gpus.size();
       }
       if (!local_ios.empty()) {
         for (unsigned idx = 0; idx < remote_ios.size(); idx++) {
@@ -243,6 +244,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_ios.size();
       }
       if (!local_omps.empty()) {
         for (unsigned idx = 0; idx < remote_omps.size(); idx++) {
@@ -255,6 +257,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_omps.size();
       } 
       if (!local_pys.empty()) {
         for (unsigned idx = 0; idx < remote_pys.size(); idx++) {
@@ -267,6 +270,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_pys.size();
       } 
       // Initialize our random number generator
       const size_t short_bits = 8*sizeof(unsigned short);
@@ -346,7 +350,8 @@ namespace Legion {
       output.initial_proc = default_policy_select_initial_processor(ctx, task);
       output.inline_task = false;
       output.stealable = stealing_enabled; 
-      // Unlike in the past, this is now the best choice
+      // This is the best choice for the default mapper assuming
+      // there is locality in the remote mapped tasks
       output.map_locally = false;
     }
 
@@ -1837,7 +1842,11 @@ namespace Legion {
         {
           for (std::deque<PhysicalInstance>::const_iterator it =
                 to_downgrade.begin(); it != to_downgrade.end(); it++)
+          {
+            if (it->is_external_instance())
+              continue;
             runtime->set_garbage_collection_priority(ctx, *it, 0/*priority*/);
+          }
         }
       }
     }
@@ -1995,8 +2004,11 @@ namespace Legion {
       // There are no constraints for these fields so we get to do what we want
       instances.resize(instances.size()+1);
       LayoutConstraintSet creation_constraints = our_constraints;
+      std::vector<FieldID> creation_fields;
+      default_policy_select_instance_fields(ctx, req, needed_fields,
+          creation_fields);
       creation_constraints.add_constraint(
-          FieldConstraint(needed_fields, false/*contig*/, false/*inorder*/));
+          FieldConstraint(creation_fields, false/*contig*/, false/*inorder*/));
       if (!default_make_instance(ctx, target_memory, creation_constraints, 
                 instances.back(), TASK_MAPPING, force_new_instances, 
                 true/*meets*/,  req))
@@ -2233,7 +2245,7 @@ namespace Legion {
       {
         int priority = default_policy_select_garbage_collection_priority(ctx, 
                 kind, target_memory, result, meets, (req.privilege == REDUCE));
-        if (priority != 0)
+        if ((priority != 0) && !result.is_external_instance())
           runtime->set_garbage_collection_priority(ctx, result,priority);
       }
       return true;
@@ -2321,6 +2333,26 @@ namespace Legion {
         return result;
       }
     }
+
+    //--------------------------------------------------------------------------
+    void DefaultMapper::default_policy_select_instance_fields(
+                                    MapperContext ctx,
+                                    const RegionRequirement &req,
+                                    const std::set<FieldID> &needed_fields,
+                                    std::vector<FieldID> &fields)
+    //--------------------------------------------------------------------------
+    {
+      if (total_nodes == 1)
+      {
+        FieldSpace handle = req.region.get_field_space();
+        runtime->get_field_space_fields(ctx, handle, fields);
+      }
+      else
+      {
+        fields.insert(fields.end(), needed_fields.begin(), needed_fields.end());
+      }
+    }
+
 
     //--------------------------------------------------------------------------
     int DefaultMapper::default_policy_select_garbage_collection_priority(
@@ -2424,13 +2456,7 @@ namespace Legion {
           machine.get_mem_mem_affinity(affinity, location, destination_memory,
 				       false /*not just local affinities*/);
           unsigned memory_bandwidth = 0;
-          if (affinity.empty()) {
-            // TODO: More graceful way of dealing with multi-hop copies
-            log_mapper.warning("Default mapper is potentially "
-                               "requesting a multi-hop copy between memories "
-                               IDFMT " and " IDFMT "!", location.id,
-                               destination_memory.id);
-          } else {
+          if (!affinity.empty()) {
             assert(affinity.size() == 1);
             memory_bandwidth = affinity[0].bandwidth;
           }

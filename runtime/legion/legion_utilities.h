@@ -32,6 +32,9 @@
 #endif
 #ifdef __ALTIVEC__
 #include <altivec.h>
+// Don't let IBM screw us over
+#undef bool
+#undef vector
 #endif
 #else // !__MACH__
 #ifdef __SSE2__
@@ -47,11 +50,13 @@
 
 // Useful macros
 #define IS_NO_ACCESS(req) (((req).privilege & READ_WRITE) == NO_ACCESS)
-#define IS_READ_ONLY(req) (((req).privilege & READ_WRITE) <= READ_ONLY)
-#define HAS_READ(req) ((req).privilege & READ_ONLY)
-#define HAS_WRITE(req) ((req).privilege & (WRITE_DISCARD | REDUCE))
-#define IS_WRITE(req) ((req).privilege & WRITE_DISCARD)
-#define IS_WRITE_ONLY(req) (((req).privilege & READ_WRITE) == WRITE_DISCARD)
+#define IS_READ_ONLY(req) (((req).privilege & READ_WRITE) <= READ_PRIV)
+#define HAS_READ(req) ((req).privilege & READ_PRIV)
+#define HAS_WRITE(req) ((req).privilege & (WRITE_PRIV | REDUCE))
+#define IS_WRITE(req) ((req).privilege & WRITE_PRIV)
+#define HAS_WRITE_DISCARD(req) (((req).privilege & WRITE_ONLY) == WRITE_ONLY)
+#define IS_DISCARD(req) (((req).privilege & DISCARD_MASK) == DISCARD_MASK)
+#define PRIV_ONLY(req) ((req).privilege & READ_WRITE)
 #define IS_REDUCE(req) (((req).privilege & READ_WRITE) == REDUCE)
 #define IS_EXCLUSIVE(req) ((req).prop == EXCLUSIVE)
 #define IS_ATOMIC(req) ((req).prop == ATOMIC)
@@ -106,9 +111,9 @@ namespace Legion {
 #endif
 #ifdef __ALTIVEC__
       template<unsigned int MAX>
-      inline void serialize(const PPCBitMask<MAX> &mask);
+      inline void serialize(const Internal::PPCBitMask<MAX> &mask);
       template<unsigned int MAX>
-      inline void serialize(const PPCTLBitMask<MAX> &mask);
+      inline void serialize(const Internal::PPCTLBitMask<MAX> &mask);
 #endif
       template<typename IT, typename DT, bool BIDIR>
       inline void serialize(
@@ -185,9 +190,9 @@ namespace Legion {
 #endif
 #ifdef __ALTIVEC__
       template<unsigned int MAX>
-      inline void deserialize(PPCBitMask<MAX> &mask);
+      inline void deserialize(Internal::PPCBitMask<MAX> &mask);
       template<unsigned int MAX>
-      inline void deserialize(PPCTLBitMask<MAX> &mask);
+      inline void deserialize(Internal::PPCTLBitMask<MAX> &mask);
 #endif
       template<typename IT, typename DT, bool BIDIR>
       inline void deserialize(Internal::IntegerSet<IT,DT,BIDIR> &index_set);
@@ -255,7 +260,7 @@ namespace Legion {
       }
       else
       {
-        if (IS_WRITE_ONLY(u2))
+        if (HAS_WRITE_DISCARD(u2))
         {
           // WAW with a write-only
           return ANTI_DEPENDENCE;
@@ -1528,7 +1533,7 @@ namespace Legion {
 #ifdef __ALTIVEC__
     //--------------------------------------------------------------------------
     template<unsigned int MAX>
-    inline void Serializer::serialize(const PPCBitMask<MAX> &mask)
+    inline void Serializer::serialize(const Internal::PPCBitMask<MAX> &mask)
     //--------------------------------------------------------------------------
     {
       mask.serialize(*this);
@@ -1536,7 +1541,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     template<unsigned int MAX>
-    inline void Serializer::serialize(const PPCTLBitMask<MAX> &mask)
+    inline void Serializer::serialize(const Internal::PPCTLBitMask<MAX> &mask)
     //--------------------------------------------------------------------------
     {
       mask.serialize(*this);
@@ -1748,7 +1753,7 @@ namespace Legion {
 #ifdef __ALTIVEC__
     //--------------------------------------------------------------------------
     template<unsigned int MAX>
-    inline void Deserializer::deserialize(PPCBitMask<MAX> &mask)
+    inline void Deserializer::deserialize(Internal::PPCBitMask<MAX> &mask)
     //--------------------------------------------------------------------------
     {
       mask.deserialize(*this);
@@ -1756,7 +1761,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     template<unsigned int MAX>
-    inline void Deserializer::deserialize(PPCTLBitMask<MAX> &mask)
+    inline void Deserializer::deserialize(Internal::PPCTLBitMask<MAX> &mask)
     //--------------------------------------------------------------------------
     {
       mask.deserialize(*this);

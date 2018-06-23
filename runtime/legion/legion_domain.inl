@@ -1083,7 +1083,7 @@ namespace Legion {
             DomainT<1,coord_t>::compute_intersection(is1,is2,
                                                   temp,dummy_requests));
           if (wait_on.exists())
-            wait_on.lg_wait();
+            wait_on.wait();
           DomainT<1,coord_t> result = temp.tighten();
           temp.destroy();
           return Domain(result);
@@ -1097,7 +1097,7 @@ namespace Legion {
             DomainT<2,coord_t>::compute_intersection(is1,is2,
                                                   temp,dummy_requests));
           if (wait_on.exists())
-            wait_on.lg_wait();
+            wait_on.wait();
           DomainT<2,coord_t> result = temp.tighten();
           temp.destroy();
           return Domain(result);
@@ -1111,7 +1111,7 @@ namespace Legion {
             DomainT<3,coord_t>::compute_intersection(is1,is2,
                                                   temp,dummy_requests));
           if (wait_on.exists())
-            wait_on.lg_wait();
+            wait_on.wait();
           DomainT<3,coord_t> result = temp.tighten();
           temp.destroy();
           return Domain(result);
@@ -1642,8 +1642,8 @@ namespace Legion {
     : m(rhs.m), n(rhs.n)
   //----------------------------------------------------------------------------
   {
-    assert(m < ::MAX_POINT_DIM);
-    assert(n < ::MAX_POINT_DIM);
+    assert(m <= ::MAX_POINT_DIM);
+    assert(n <= ::MAX_POINT_DIM);
     for (int i = 0; i < m; i++)
       for (int j = 0; j < n; j++)
         matrix[i * n + j] = rhs.matrix[i * n + j];
@@ -1655,8 +1655,8 @@ namespace Legion {
     : m(M), n(N)
   //----------------------------------------------------------------------------
   {
-    assert(m < ::MAX_POINT_DIM);
-    assert(n < ::MAX_POINT_DIM);
+    assert(m <= ::MAX_POINT_DIM);
+    assert(n <= ::MAX_POINT_DIM);
     for (int i = 0; i < M; i++)
       for (int j = 0; j < N; j++)
         matrix[i * n + j] = rhs[i][j];
@@ -1668,8 +1668,8 @@ namespace Legion {
   {
     m = rhs.m;
     n = rhs.n;
-    assert(m < ::MAX_POINT_DIM);
-    assert(n < ::MAX_POINT_DIM);
+    assert(m <= ::MAX_POINT_DIM);
+    assert(n <= ::MAX_POINT_DIM);
     for (int i = 0; i < m; i++)
       for (int j = 0; j < n; j++)
         matrix[i * n + j] = rhs.matrix[i * n + j];
@@ -1684,8 +1684,8 @@ namespace Legion {
   {
     m = M;
     n = N;
-    assert(m < ::MAX_POINT_DIM);
-    assert(n < ::MAX_POINT_DIM);
+    assert(m <= ::MAX_POINT_DIM);
+    assert(n <= ::MAX_POINT_DIM);
     for (int i = 0; i < M; i++)
       for (int j = 0; j < N; j++)
         matrix[i * n + j] = rhs[i][j];

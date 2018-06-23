@@ -133,7 +133,6 @@ namespace Realm {
 
       int compute_major, compute_minor;
       size_t total_mem;
-      CUdevprop props;
       std::set<CUdevice> peers;  // other GPUs we can do p2p copies with
     };
 
@@ -274,6 +273,55 @@ namespace Realm {
       GPUCompletionNotification *notification;
     };
 
+    class GPUMemset1D : public GPUMemcpy {
+    public:
+      GPUMemset1D(GPU *_gpu,
+		  void *_dst, size_t _bytes,
+		  const void *_fill_data, size_t _fill_data_size,
+		  GPUCompletionNotification *_notification);
+
+      virtual ~GPUMemset1D(void);
+
+    public:
+      virtual void execute(GPUStream *stream);
+    protected:
+      void *dst;
+      size_t bytes;
+      static const size_t MAX_DIRECT_SIZE = 8;
+      union {
+	char direct[8];
+	void *indirect;
+      } fill_data;
+      size_t fill_data_size;
+      GPUCompletionNotification *notification;
+    };
+
+    class GPUMemset2D : public GPUMemcpy {
+    public:
+      GPUMemset2D(GPU *_gpu,
+		  void *_dst, size_t _dst_stride,
+		  size_t _bytes, size_t _lines,
+		  const void *_fill_data, size_t _fill_data_size,
+		  GPUCompletionNotification *_notification);
+
+      virtual ~GPUMemset2D(void);
+
+    public:
+      void do_span(off_t pos, size_t len);
+      virtual void execute(GPUStream *stream);
+    protected:
+      void *dst;
+      size_t dst_stride;
+      size_t bytes, lines;
+      static const size_t MAX_DIRECT_SIZE = 8;
+      union {
+	char direct[8];
+	void *indirect;
+      } fill_data;
+      size_t fill_data_size;
+      GPUCompletionNotification *notification;
+    };
+
     // a class that represents a CUDA stream and work associated with 
     //  it (e.g. queued copies, events in flight)
     // a stream is also associated with a GPUWorker that it will register
@@ -408,7 +456,7 @@ namespace Realm {
 
       void create_dma_channels(Realm::RuntimeImpl *r);
 
-      // copy operations are asynchronous - use a fence (of the right type)
+      // copy and operations are asynchronous - use a fence (of the right type)
       //   after all of your copies, or a completion notification for particular copies
       void copy_to_fb(off_t dst_offset, const void *src, size_t bytes,
 		      GPUCompletionNotification *notification = 0);
@@ -467,6 +515,17 @@ namespace Realm {
                            off_t dst_height, off_t src_height,
                            size_t bytes, size_t height, size_t depth,
 			   GPUCompletionNotification *notification = 0);
+
+      // fill operations are also asynchronous - use fence_within_fb at end
+      void fill_within_fb(off_t dst_offset,
+			  size_t bytes,
+			  const void *fill_data, size_t fill_data_size,
+			  GPUCompletionNotification *notification = 0);
+
+      void fill_within_fb_2d(off_t dst_offset, off_t dst_stride,
+			     size_t bytes, size_t lines,
+			     const void *fill_data, size_t fill_data_size,
+			     GPUCompletionNotification *notification = 0);
 
       void fence_to_fb(Realm::Operation *op);
       void fence_from_fb(Realm::Operation *op);
@@ -534,6 +593,11 @@ namespace Realm {
       static GPUProcessor *get_current_gpu_proc(void);
 
       // calls that come from the CUDA runtime API
+      void push_call_configuration(dim3 grid_dim, dim3 block_dim,
+                                   size_t shared_size, void *stream);
+      void pop_call_configuration(dim3 *grid_dim, dim3 *block_dim,
+                                  size_t *shared_size, void *stream);
+
       void stream_synchronize(cudaStream_t stream);
       void device_synchronize(void);
 
@@ -547,6 +611,8 @@ namespace Realm {
 			  size_t shared_memory, cudaStream_t stream);
       void setup_argument(const void *arg, size_t size, size_t offset);
       void launch(const void *func);
+      void launch_kernel(const void *func, dim3 grid_dim, dim3 block_dim, 
+                         void **args, size_t shared_memory, cudaStream_t stream);
 
       void gpu_memcpy(void *dst, const void *src, size_t size, cudaMemcpyKind kind);
       void gpu_memcpy_async(void *dst, const void *src, size_t size,
@@ -574,9 +640,13 @@ namespace Realm {
         size_t shared;
 	LaunchConfig(dim3 _grid, dim3 _block, size_t _shared);
       };
+      struct CallConfig : public LaunchConfig {
+        cudaStream_t stream; 
+        CallConfig(dim3 _grid, dim3 _block, size_t _shared, cudaStream_t _stream);
+      };
       std::vector<LaunchConfig> launch_configs;
       std::vector<char> kernel_args;
-
+      std::vector<CallConfig> call_configs;
     protected:
       Realm::CoreReservation *core_rsrv;
     };

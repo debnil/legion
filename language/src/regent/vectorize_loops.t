@@ -43,7 +43,7 @@ else
     SIMD_REG_SIZE = 32
   elseif os.execute("grep sse /proc/cpuinfo > /dev/null") == 0 then
     SIMD_REG_SIZE = 16
-  elseif os.execute("grep POWER8 /proc/cpuinfo > /dev/null") == 0 then
+  elseif os.execute("grep altivec /proc/cpuinfo > /dev/null") == 0 then
     SIMD_REG_SIZE = 16
   else
     error("Unable to determine CPU architecture")
@@ -470,7 +470,7 @@ end
 function min_simd_width.type(reg_size, ty)
   assert(not (std.is_ref(ty) or std.is_rawref(ty)))
   if std.is_bounded_type(ty) then
-    return reg_size / sizeof(uint32)
+    return reg_size / sizeof(int64)
   elseif ty:isarray() then
     return reg_size / sizeof(ty.type)
   elseif ty:isstruct() then

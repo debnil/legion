@@ -17,8 +17,8 @@
 
 from __future__ import print_function
 
-import legion
+from legion import task
 
-@legion.task
+@task(top_level=True)
 def main():
     print("Hello, Legion!")

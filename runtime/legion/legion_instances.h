@@ -124,7 +124,6 @@ namespace Legion {
     public:
       void log_instance_creation(UniqueID creator_id, Processor proc,
                      const std::vector<LogicalRegion> &regions) const;
-      void force_deletion(void);
     public:
       inline bool is_reduction_manager(void) const;
       inline bool is_instance_manager(void) const;
@@ -192,9 +191,12 @@ namespace Legion {
       }
       inline Memory get_memory(void) const { return memory_manager->memory; }
     public:
+      bool acquire_instance(ReferenceSource source, ReferenceMutator *mutator);
       void perform_deletion(RtEvent deferred_event);
+      void force_deletion(void);
       void set_garbage_collection_priority(MapperID mapper_id, Processor p,
                                            GCPriority priority); 
+      RtEvent detach_external_instance(void);
     public:
       static inline DistributedID encode_instance_did(DistributedID did,
                                                       bool external);
@@ -479,18 +481,6 @@ namespace Legion {
       virtual void send_manager(AddressSpaceID target);
       virtual InstanceView* create_instance_top_view(InnerContext *context,
                                             AddressSpaceID logical_owner);
-    public:
-      static inline VirtualManager* get_virtual_instance(void)
-        { return get_singleton(); }
-      static void initialize_virtual_instance(Runtime *runtime,
-                                              DistributedID did);
-      static void finalize_virtual_instance(void);
-    protected:
-      static inline VirtualManager*& get_singleton(void)
-      {
-        static VirtualManager *singleton = NULL;
-        return singleton;
-      }
     };
 
     /**
@@ -505,8 +495,7 @@ namespace Legion {
         : regions(regs), constraints(cons), runtime(rt), memory_manager(memory),
           creator_id(cid), instance(PhysicalInstance::NO_INST), ancestor(NULL), 
           instance_domain(NULL), own_domain(false), redop_id(0), 
-          reduction_op(NULL), realm_layout(NULL), 
-          own_realm_layout(true), valid(false) { }
+          reduction_op(NULL), valid(false) { }
       virtual ~InstanceBuilder(void);
     public:
       size_t compute_needed_size(RegionTreeForest *forest);
@@ -546,8 +535,7 @@ namespace Legion {
       FieldMask instance_mask;
       ReductionOpID redop_id;
       const ReductionOp *reduction_op;
-      Realm::InstanceLayoutGeneric *realm_layout;
-      bool own_realm_layout;
+      Realm::InstanceLayoutConstraints realm_constraints;
     public:
       bool valid;
     };

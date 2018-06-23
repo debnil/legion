@@ -14,13 +14,17 @@
 
 -- Regent Standard Library
 
+local affine_helper = require("regent/affine_helper")
 local ast = require("regent/ast")
 local base = require("regent/std_base")
-local data = require("common/data")
-local header_helper = require("regent/header_helper")
-local report = require("common/report")
-local pretty = require("regent/pretty")
 local cudahelper = require("regent/cudahelper")
+local data = require("common/data")
+local ffi = require("ffi")
+local header_helper = require("regent/header_helper")
+local log = require("common/log")
+local pretty = require("regent/pretty")
+local profile = require("regent/profile")
+local report = require("common/report")
 
 local std = {}
 
@@ -269,7 +273,101 @@ function std.check_any_privilege(cx, region, field_path)
   return false
 end
 
-function std.search_constraint(cx, region, constraint, visited, reflexive, symmetric)
+local function analyze_uses_variables_node(variables)
+  return function(node)
+    -- Expressions:
+    if node:is(ast.typed.expr.ID) then
+      return variables[node.value]
+
+    elseif node:is(ast.typed.expr.FieldAccess) or
+      node:is(ast.typed.expr.IndexAccess) or
+      node:is(ast.typed.expr.MethodCall) or
+      node:is(ast.typed.expr.Call) or
+      node:is(ast.typed.expr.RawContext) or
+      node:is(ast.typed.expr.RawFields) or
+      node:is(ast.typed.expr.RawPhysical) or
+      node:is(ast.typed.expr.RawRuntime) or
+      node:is(ast.typed.expr.RawValue) or
+      node:is(ast.typed.expr.Isnull) or
+      node:is(ast.typed.expr.Null) or
+      node:is(ast.typed.expr.DynamicCast) or
+      node:is(ast.typed.expr.StaticCast) or
+      node:is(ast.typed.expr.UnsafeCast) or
+      node:is(ast.typed.expr.Ispace) or
+      node:is(ast.typed.expr.Region) or
+      node:is(ast.typed.expr.Partition) or
+      node:is(ast.typed.expr.PartitionEqual) or
+      node:is(ast.typed.expr.PartitionByField) or
+      node:is(ast.typed.expr.Image) or
+      node:is(ast.typed.expr.Preimage) or
+      node:is(ast.typed.expr.CrossProduct) or
+      node:is(ast.typed.expr.ListSlicePartition) or
+      node:is(ast.typed.expr.ListDuplicatePartition) or
+      node:is(ast.typed.expr.ListSliceCrossProduct) or
+      node:is(ast.typed.expr.ListCrossProduct) or
+      node:is(ast.typed.expr.ListCrossProductComplete) or
+      node:is(ast.typed.expr.ListPhaseBarriers) or
+      node:is(ast.typed.expr.ListInvert) or
+      node:is(ast.typed.expr.ListRange) or
+      node:is(ast.typed.expr.PhaseBarrier) or
+      node:is(ast.typed.expr.DynamicCollective) or
+      node:is(ast.typed.expr.DynamicCollectiveGetResult) or
+      node:is(ast.typed.expr.Advance) or
+      node:is(ast.typed.expr.Adjust) or
+      node:is(ast.typed.expr.Arrive) or
+      node:is(ast.typed.expr.Await) or
+      node:is(ast.typed.expr.Copy) or
+      node:is(ast.typed.expr.Fill) or
+      node:is(ast.typed.expr.Acquire) or
+      node:is(ast.typed.expr.Release) or
+      node:is(ast.typed.expr.AllocateScratchFields) or
+      node:is(ast.typed.expr.WithScratchFields) or
+      node:is(ast.typed.expr.RegionRoot) or
+      node:is(ast.typed.expr.Condition) or
+      node:is(ast.typed.expr.Deref)
+    then
+      return false
+
+    elseif node:is(ast.typed.expr.Constant) or
+      node:is(ast.typed.expr.Function) or
+      node:is(ast.typed.expr.Cast) or
+      node:is(ast.typed.expr.Ctor) or
+      node:is(ast.typed.expr.CtorListField) or
+      node:is(ast.typed.expr.CtorRecField) or
+      node:is(ast.typed.expr.Unary) or
+      node:is(ast.typed.expr.Binary)
+    then
+      return false
+
+    -- Miscellaneous:
+    elseif node:is(ast.location) or
+      node:is(ast.annotation) or
+      node:is(ast.condition_kind)
+    then
+      return false
+
+    else
+      assert(false, "unexpected node type " .. tostring(node.node_type))
+    end
+  end
+end
+
+local function analyze_uses_variables(node, variables)
+  return ast.mapreduce_node_postorder(
+    analyze_uses_variables_node(variables),
+    data.any,
+    node, false)
+end
+
+local function uses_variables(region, variables)
+  if region:has_index_expr() then
+    return analyze_uses_variables(region:get_index_expr(), variables)
+  end
+  return false
+end
+
+function std.search_constraint(cx, region, constraint, exclude_variables,
+                               visited, reflexive, symmetric)
   return std.search_constraint_predicate(
     cx, region, visited,
     function(cx, region)
@@ -279,7 +377,10 @@ function std.search_constraint(cx, region, constraint, visited, reflexive, symme
 
       if cx.constraints:has(constraint.op) and
         cx.constraints[constraint.op]:has(region) and
-        cx.constraints[constraint.op][region][constraint.rhs]
+        cx.constraints[constraint.op][region][constraint.rhs] and
+        not (exclude_variables and
+               uses_variables(region, exclude_variables) and
+               uses_variables(constraint.rhs, exclude_variables))
       then
         return true
       end
@@ -290,7 +391,9 @@ function std.search_constraint(cx, region, constraint, visited, reflexive, symme
           rhs = region,
           op = constraint.op,
         }
-        if std.search_constraint(cx, constraint.lhs, constraint, {}, reflexive, false) then
+        if std.search_constraint(cx, constraint.lhs, constraint,
+                                 exclude_variables, {}, reflexive, false)
+        then
           return true
         end
       end
@@ -299,7 +402,7 @@ function std.search_constraint(cx, region, constraint, visited, reflexive, symme
     end)
 end
 
-function std.check_constraint(cx, constraint)
+function std.check_constraint(cx, constraint, exclude_variables)
   local lhs = constraint.lhs
   if lhs == std.wild then
     return true
@@ -324,7 +427,7 @@ function std.check_constraint(cx, constraint)
     op = constraint.op,
   }
   return std.search_constraint(
-    cx, constraint.lhs, constraint, {},
+    cx, constraint.lhs, constraint, exclude_variables, {},
     constraint.op == std.subregion --[[ reflexive ]],
     constraint.op == std.disjointness --[[ symmetric ]])
 end
@@ -497,21 +600,6 @@ function std.type_maybe_eq(a, b, mapping)
     return std.type_maybe_eq(a.element_type, b.element_type, mapping)
   else
     return false
-  end
-end
-
-function std.type_meet(a, b)
-  local function test()
-    local terra query(x : a, y : b)
-      if true then return x end
-      if true then return y end
-    end
-    return query:gettype().returntype
-  end
-  local valid, result_type = pcall(test)
-
-  if valid then
-    return result_type
   end
 end
 
@@ -732,7 +820,7 @@ function std.validate_args(node, params, args, isvararg, return_type, mapping, s
       -- Ok
       need_cast[i] = false
     elseif type_compatible(param_type, arg_type) then
-      -- Regions (and other unique types) require a special pass here 
+      -- Regions (and other unique types) require a special pass here
 
       -- Check for previous mappings. This can happen if two
       -- parameters are aliased to the same region.
@@ -1168,6 +1256,8 @@ local function compute_serialized_size_inner(value_type, value)
       end
     end
     return actions, result
+  elseif std.is_string(value_type) then
+    return quote end, `(c.strlen([rawstring](value)) + 1)
   else
     return quote end, 0
   end
@@ -1218,6 +1308,12 @@ local function serialize_inner(value_type, value, fixed_ptr, data_ptr)
         @[data_ptr] = @[data_ptr] + terralib.sizeof(element_type)
         [ser_actions]
       end
+    end
+  elseif std.is_string(value_type) then
+    actions = quote
+      [actions]
+      c.strcpy([rawstring](@[data_ptr]), [rawstring]([value]))
+      @[data_ptr] = @[data_ptr] + c.strlen([rawstring]([value])) + 1
     end
   end
 
@@ -1272,6 +1368,12 @@ local function deserialize_inner(value_type, fixed_ptr, data_ptr)
         [deser_actions]
         ([&element_type]([result].__data))[i] = [deser_value]
       end
+    end
+  elseif std.is_string(value_type) then
+    actions = quote
+      [actions]
+      [result] = c.strdup([rawstring](@[data_ptr]))
+      @[data_ptr] = @[data_ptr] + c.strlen([rawstring]([result])) + 1
     end
   end
 
@@ -1374,78 +1476,11 @@ end
 -- ## Codegen Helpers
 -- #################
 
-local gen_optimal = terralib.memoize(
-  function(op, lhs_type, rhs_type)
-    return terra(lhs : lhs_type, rhs : rhs_type)
-      if [std.quote_binary_op(op, lhs, rhs)] then
-        return lhs
-      else
-        return rhs
-      end
-    end
-  end)
-
-std.fmax = macro(
-  function(lhs, rhs)
-    local lhs_type, rhs_type = lhs:gettype(), rhs:gettype()
-    local result_type = std.type_meet(lhs_type, rhs_type)
-    assert(result_type)
-    return `([gen_optimal(">", lhs_type, rhs_type)]([lhs], [rhs]))
-  end)
-
-std.fmin = macro(
-  function(lhs, rhs)
-    local lhs_type, rhs_type = lhs:gettype(), rhs:gettype()
-    local result_type = std.type_meet(lhs_type, rhs_type)
-    assert(result_type)
-    return `([gen_optimal("<", lhs_type, rhs_type)]([lhs], [rhs]))
-  end)
-
-function std.quote_unary_op(op, rhs)
-  if op == "-" then
-    return `(-[rhs])
-  elseif op == "not" then
-    return `(not [rhs])
-  else
-    assert(false, "unknown operator " .. tostring(op))
-  end
-end
-
-function std.quote_binary_op(op, lhs, rhs)
-  if op == "*" then
-    return `([lhs] * [rhs])
-  elseif op == "/" then
-    return `([lhs] / [rhs])
-  elseif op == "%" then
-    return `([lhs] % [rhs])
-  elseif op == "+" then
-    return `([lhs] + [rhs])
-  elseif op == "-" then
-    return `([lhs] - [rhs])
-  elseif op == "<" then
-    return `([lhs] < [rhs])
-  elseif op == ">" then
-    return `([lhs] > [rhs])
-  elseif op == "<=" then
-    return `([lhs] <= [rhs])
-  elseif op == ">=" then
-    return `([lhs] >= [rhs])
-  elseif op == "==" then
-    return `([lhs] == [rhs])
-  elseif op == "~=" then
-    return `([lhs] ~= [rhs])
-  elseif op == "and" then
-    return `([lhs] and [rhs])
-  elseif op == "or" then
-    return `([lhs] or [rhs])
-  elseif op == "max" then
-    return `([std.fmax]([lhs], [rhs]))
-  elseif op == "min" then
-    return `([std.fmin]([lhs], [rhs]))
-  else
-    assert(false, "unknown operator " .. tostring(op))
-  end
-end
+std.type_meet = base.type_meet
+std.fmax = base.fmax
+std.fmin = base.fmin
+std.quote_unary_op = base.quote_unary_op
+std.quote_binary_op = base.quote_binary_op
 
 -- #####################################
 -- ## Types
@@ -1657,14 +1692,21 @@ local bounded_type = terralib.memoize(function(index_type, ...)
     -- Find the smallest bitmask that will fit.
     -- TODO: Would be nice to compress smaller than one byte.
    local bitmask_type
-    if #bounds < bit.lshift(1, 8) - 1 then
-      bitmask_type = uint8
-    elseif #bounds < bit.lshift(1, 16) - 1 then
-      bitmask_type = uint16
-    elseif #bounds < bit.lshift(1, 32) - 1 then
-      bitmask_type = uint32
+    if terralib.llvmversion >= 38 then
+      if #bounds <= bit.lshift(1, 8) then
+        bitmask_type = uint8
+      elseif #bounds <= bit.lshift(1, 16) then
+        bitmask_type = uint16
+      -- XXX: What we really want here is bit.lshift(1ULL, 32),
+      --      which is supported only in LuaJIT 2.1 or higher
+      elseif #bounds <= bit.lshift(1, 30) then
+        bitmask_type = uint32
+      else
+        assert(false) -- really?
+      end
     else
-      assert(false) -- really?
+      assert(#bounds <= bit.lshift(1, 30))
+      bitmask_type = uint32
     end
     st.entries:insert({ "__index", bitmask_type })
   end
@@ -2177,6 +2219,7 @@ do
     st.is_region = true
     st.ispace_symbol = ispace_symbol
     st.fspace_type = fspace_type
+    st.index_expr = false
 
     function st:ispace()
       local ispace = self.ispace_symbol:gettype()
@@ -2192,6 +2235,21 @@ do
 
     function st:fspace()
       return st.fspace_type
+    end
+
+    function st:has_index_expr()
+      return st.index_expr
+    end
+
+    function st:get_index_expr()
+      assert(st.index_expr)
+      return st.index_expr
+    end
+
+    function st:set_index_expr(expr)
+      assert(not st.index_expr)
+      assert(ast.is_node(expr))
+      st.index_expr = expr
     end
 
     -- For API compatibility with std.list:
@@ -2240,23 +2298,6 @@ std.wild = std.newsymbol(std.wild_type, "wild")
 std.disjoint = ast.disjointness_kind.Disjoint {}
 std.aliased = ast.disjointness_kind.Aliased {}
 
--- This is used in methods such as subregion_constant where the index
--- of a subregion has to be munged to make it safe to go in a map.
-local function get_subregion_index(i)
-  if type(i) == "number" or std.is_symbol(i) then
-    return i
-  elseif terralib.isconstant(i) and std.is_index_type(i.type) then
-    -- Terra, pretty please give me the value inside this constant
-    local value = (terra() return i end)()
-    return data.newtuple(
-      unpack(
-        i.type.fields:map(
-          function(field_name) return value.__ptr[field_name] end)))
-  else
-    assert(false)
-  end
-end
-
 do
   local next_partition_id = 1
   function std.partition(disjointness, region_symbol, colors_symbol)
@@ -2293,6 +2334,7 @@ do
     st.disjointness = disjointness
     st.parent_region_symbol = region_symbol
     st.colors_symbol = colors_symbol
+    st.index_expr = false
     st.subregions = data.newmap()
 
     function st:is_disjoint()
@@ -2323,16 +2365,32 @@ do
       return self:parent_region():fspace()
     end
 
+    function st:has_index_expr()
+      return st.index_expr
+    end
+
+    function st:get_index_expr()
+      assert(st.index_expr)
+      return st.index_expr
+    end
+
+    function st:set_index_expr(expr)
+      assert(not st.index_expr)
+      assert(ast.is_node(expr))
+      st.index_expr = expr
+    end
+
     function st:subregions_constant()
       return self.subregions
     end
 
-    function st:subregion_constant(i)
-      local i = get_subregion_index(i)
-      if not self.subregions[i] then
-        self.subregions[i] = self:subregion_dynamic()
+    function st:subregion_constant(index_expr)
+      local index = affine_helper.get_subregion_index(index_expr)
+      if not self.subregions[index] then
+        self.subregions[index] = self:subregion_dynamic()
+        self.subregions[index]:set_index_expr(index_expr)
       end
-      return self.subregions[i]
+      return self.subregions[index]
     end
 
     function st:subregion_dynamic()
@@ -2400,6 +2458,7 @@ function std.cross_product(...)
 
   st.is_cross_product = true
   st.partition_symbols = data.newtuple(unpack(partition_symbols))
+  st.index_expr = false
   st.subpartitions = data.newmap()
 
   function st:partitions()
@@ -2429,6 +2488,21 @@ function std.cross_product(...)
     return self:partition():parent_region()
   end
 
+    function st:has_index_expr()
+      return st.index_expr
+    end
+
+    function st:get_index_expr()
+      assert(st.index_expr)
+      return st.index_expr
+    end
+
+    function st:set_index_expr(expr)
+      assert(not st.index_expr)
+      assert(ast.is_node(expr))
+      st.index_expr = expr
+    end
+
   function st:subregion_constant(i)
     local region_type = self:partition():subregion_constant(i)
     return region_type
@@ -2443,14 +2517,15 @@ function std.cross_product(...)
     return region_type
   end
 
-  function st:subpartition_constant(i)
-    local region_type = self:subregion_constant(i)
-    local i = get_subregion_index(i)
-    if not self.subpartitions[i] then
+  function st:subpartition_constant(index_expr)
+    local region_type = self:subregion_constant(index_expr)
+    local index = affine_helper.get_subregion_index(index_expr)
+    if not self.subpartitions[index] then
       local partition = st:subpartition_dynamic(region_type)
-      self.subpartitions[i] = partition
+      self.subpartitions[index] = partition
+      self.subpartitions[index]:set_index_expr(index_expr)
     end
-    return self.subpartitions[i]
+    return self.subpartitions[index]
   end
 
   function st:subpartition_dynamic(region_type)
@@ -2509,7 +2584,7 @@ std.vptr = terralib.memoize(function(width, points_to_type, ...)
   if #bounds > 1 then
     -- Find the smallest bitmask that will fit.
     -- TODO: Would be nice to compress smaller than one byte.
-    if #bounds < bit.lshift(1, 8) - 1 then
+    if #bounds < bit.lshift(1, 8) - 1 and terralib.llvmversion >= 38 then
       bitmask_type = vector(uint8, width)
     elseif #bounds < bit.lshift(1, 16) - 1 then
       bitmask_type = vector(uint16, width)
@@ -3005,6 +3080,29 @@ do
   end
 end
 
+do
+  -- Wrapper for a null-terminated string.
+  local st = terralib.types.newstruct("string")
+  st.entries = terralib.newlist({
+      { "impl", rawstring },
+  })
+  st.is_string = true
+
+  function st.metamethods.__cast(from, to, expr)
+    if std.is_string(to) then
+      if std.type_eq(from, rawstring) then
+        return `([to]{ impl = [expr] })
+      end
+    elseif std.type_eq(to, rawstring) then
+      if std.is_string(from) then
+        return `([expr].impl)
+      end
+    end
+    assert(false)
+  end
+  std.string = st
+end
+
 -- #####################################
 -- ## Tasks
 -- #################
@@ -3143,43 +3241,25 @@ end
 -- ## Main
 -- #################
 
+local projection_functors = terralib.newlist()
+
+do
+  local next_id = 1
+  function std.register_projection_functor(depth, region_functor, partition_functor)
+    local id = next_id
+    next_id = next_id + 1
+
+    projection_functors:insert(terralib.newlist({id, depth, region_functor, partition_functor}))
+
+    return id
+  end
+end
+
 local variants = terralib.newlist()
 
 function std.register_variant(variant)
   assert(std.is_variant(variant))
   variants:insert(variant)
-end
-
-local function make_task_wrapper(task_body)
-  local return_type = task_body:gettype().returntype
-  if return_type == terralib.types.unit then
-    return terra(data : &opaque, datalen : c.size_t,
-                 userdata : &opaque, userlen : c.size_t,
-                 proc_id : c.legion_proc_id_t)
-      var task : c.legion_task_t,
-          regions : &c.legion_physical_region_t,
-          num_regions : uint32,
-          ctx : c.legion_context_t,
-          runtime : c.legion_runtime_t
-      c.legion_task_preamble(data, datalen, proc_id, &task, &regions, &num_regions, &ctx, &runtime)
-      task_body(task, regions, num_regions, ctx, runtime)
-      c.legion_task_postamble(runtime, ctx, nil, 0)
-    end
-  else
-    return terra(data : &opaque, datalen : c.size_t,
-                 userdata : &opaque, userlen : c.size_t,
-                 proc_id : c.legion_proc_id_t)
-      var task : c.legion_task_t,
-          regions : &c.legion_physical_region_t,
-          num_regions : uint32,
-          ctx : c.legion_context_t,
-          runtime : c.legion_runtime_t
-      c.legion_task_preamble(data, datalen, proc_id, &task, &regions, &num_regions, &ctx, &runtime)
-      var result = task_body(task, regions, num_regions, ctx, runtime)
-      c.legion_task_postamble(runtime, ctx, result.value, result.size)
-      c.free(result.value)
-    end
-  end
 end
 
 local max_dim = 3 -- Maximum dimension of an index space supported in Regent
@@ -3265,7 +3345,7 @@ local function make_reduction_layout(dim, op_id)
   end
 end
 
-function std.setup(main_task, extra_setup_thunk, registration_name)
+function std.setup(main_task, extra_setup_thunk, task_wrappers, registration_name)
   assert(not main_task or std.is_task(main_task))
 
   if not registration_name then
@@ -3320,6 +3400,30 @@ function std.setup(main_task, extra_setup_thunk, registration_name)
     end
   end
 
+  local projection_functor_registrations = projection_functors:map(
+    function(args)
+      local id, depth, region_functor, partition_functor = unpack(args)
+      -- Hack: Work around Terra not wanting to escape nil.
+      if region_functor and partition_functor then
+        return quote
+          c.legion_runtime_preregister_projection_functor(
+            id, depth, region_functor, partition_functor)
+        end
+      elseif region_functor then
+        return quote
+          c.legion_runtime_preregister_projection_functor(
+            id, depth, region_functor, nil)
+        end
+      elseif partition_functor then
+        return quote
+          c.legion_runtime_preregister_projection_functor(
+            id, depth, nil, partition_functor)
+        end
+      else
+        assert(false)
+      end
+    end)
+
   local task_registrations = variants:map(
     function(variant)
       local task = variant.task
@@ -3352,8 +3456,6 @@ function std.setup(main_task, extra_setup_thunk, registration_name)
       if std.config["cuda"] and task:is_shard_task() then
         proc_types[#proc_types + 1] = c.TOC_PROC
       end
-
-      local wrapped_task = make_task_wrapper(variant:get_definition())
 
       local layout_constraints = terralib.newsymbol(
         c.legion_task_layout_constraint_set_t, "layout_constraints")
@@ -3408,7 +3510,7 @@ function std.setup(main_task, extra_setup_thunk, registration_name)
             [task:get_task_id()],
             [task:get_name():concat(".")],
             execution_constraints, layout_constraints, options,
-            [wrapped_task], nil, 0)
+            [task_wrappers[variant:wrapper_name()]], nil, 0)
           c.legion_execution_constraint_set_destroy(execution_constraints)
           c.legion_task_layout_constraint_set_destroy(layout_constraints)
         end)
@@ -3456,6 +3558,7 @@ function std.setup(main_task, extra_setup_thunk, registration_name)
   local terra main([argc], [argv])
     [reduction_registrations];
     [layout_registrations];
+    [projection_functor_registrations];
     [task_registrations];
     [cuda_setup];
     [extra_setup];
@@ -3467,11 +3570,223 @@ function std.setup(main_task, extra_setup_thunk, registration_name)
   return main, names
 end
 
+-- Generate all task wrappers in this process, the compiler will pick them up
+-- automatically.
+local function make_task_wrappers()
+  local task_wrappers = {}
+  for _,variant in ipairs(variants) do
+    task_wrappers[variant:wrapper_name()] = variant:make_wrapper()
+  end
+  return task_wrappers
+end
+
+local struct Pipe {
+  read_end : int,
+  write_end : int,
+}
+
+local terra make_pipe()
+  var fd : int[2]
+  var res = c.pipe(fd)
+  if res ~= 0 then
+    c.perror('pipe creation failed')
+    c.exit(c.EXIT_FAILURE)
+  end
+  return Pipe{ read_end = fd[0], write_end = fd[1] }
+end
+
+terra Pipe:close_read_end()
+  c.close(self.read_end)
+end
+
+terra Pipe:close_write_end()
+  c.close(self.write_end)
+end
+
+terra Pipe:write_int(x : int)
+  var bytes_written = c.write(self.write_end, &x, sizeof(int))
+  if bytes_written ~= sizeof(int) then
+    c.perror('pipe: int write error')
+    c.exit(c.EXIT_FAILURE)
+  end
+end
+
+terra Pipe:read_int() : int
+  var x : int
+  var bytes_read = c.read(self.read_end, &x, sizeof(int))
+  if bytes_read ~= sizeof(int) then
+    c.perror('pipe: int read error')
+    c.exit(c.EXIT_FAILURE)
+  end
+  return x
+end
+
+-- String can be up to 255 characters long.
+terra Pipe:write_string(str : &int8)
+  var len = c.strlen(str)
+  if len >= 256 then
+    var stderr = c.fdopen(2, "w")
+    c.fprintf(stderr, 'pipe: string too long for writing')
+    c.fflush(stderr)
+    c.exit(c.EXIT_FAILURE)
+  end
+  var bytes_written = c.write(self.write_end, str, len + 1)
+  if bytes_written ~= len + 1 then
+    c.perror('pipe: string write error')
+    c.exit(c.EXIT_FAILURE)
+  end
+end
+
+-- Returned pointer must be manually free'd.
+terra Pipe:read_string() : &int8
+  var buf : int8[256]
+  var bytes_read = c.read(self.read_end, &(buf[0]), 256)
+  if bytes_read <= 0 then
+    c.perror('pipe: string read error')
+    c.exit(c.EXIT_FAILURE)
+  end
+  var len = c.strlen(buf)
+  if len >= 256 then
+    c.perror('pipe: string read error')
+    c.exit(c.EXIT_FAILURE)
+  end
+  var str = [&int8](c.malloc(len + 1))
+  c.strncpy(str, buf, len + 1)
+  return str
+end
+
+local function compile_tasks_in_parallel()
+  -- Force codegen; the main process will need to codegen later anyway, so we
+  -- might as well do it now and not duplicate the work on the children.
+  for _,variant in ipairs(variants) do
+    variant.task:complete()
+  end
+
+  -- Don't spawn extra processes if jobs == 1.
+  local num_slaves = math.max(tonumber(std.config["jobs"]) or 1, 1)
+  if num_slaves == 1 then
+    return terralib.newlist(), make_task_wrappers()
+  end
+
+  -- Spawn slave processes & distribute work to them on demand.
+  -- TODO: Terra functions used by more than one task may get compiled
+  -- multiple times, and included in multiple object files by different
+  -- children. This will cause bloat in the final executable.
+  local pclog = log.make_logger('paral_compile')
+  local objfiles = terralib.newlist()
+  local slave_pids = terralib.newlist()
+  local slave_pipes = terralib.newlist()
+  local slave2master = make_pipe()
+  for slave_id = 1,num_slaves do
+    pclog:info('master: spawning slave ' .. slave_id)
+    local master2slave = make_pipe()
+    slave_pipes:insert(master2slave)
+    local pid = c.fork()
+    assert(pid >= 0, 'fork failed')
+    if pid == 0 then
+      slave2master:close_read_end()
+      master2slave:close_write_end()
+      while true do
+        pclog:info('slave ' .. slave_id .. ': signaling master to send work')
+        slave2master:write_int(slave_id)
+        local variant_id = master2slave:read_int()
+        assert(0 <= variant_id and variant_id <= #variants,
+               'slave ' .. slave_id .. ': variant id read error')
+        if variant_id == 0 then
+          pclog:info('slave ' .. slave_id .. ': stopping')
+          break
+        end
+        local raw_filename = master2slave:read_string()
+        local filename = ffi.string(raw_filename)
+        c.free(raw_filename)
+        local variant = variants[variant_id]
+        pclog:info('slave ' .. slave_id .. ': compiling ' ..
+                   tostring(variant) .. ' to file ' .. filename)
+        local exports = {}
+        exports[variant:wrapper_name()] = variant:make_wrapper()
+        profile('compile', variant, function()
+          terralib.saveobj(filename, 'object', exports)
+        end)()
+      end
+      slave2master:close_write_end()
+      master2slave:close_read_end()
+      os.exit(c.EXIT_SUCCESS)
+    else
+      pclog:info('master: slave ' .. slave_id .. ' spawned as pid ' .. pid)
+      slave_pids:insert(pid)
+      master2slave:close_read_end()
+    end
+  end
+  slave2master:close_write_end()
+  local next_variant = 1
+  local num_stopped = 0
+  while num_stopped < num_slaves do
+    pclog:info('master: waiting for next available slave')
+    local slave_id = slave2master:read_int()
+    assert(1 <= slave_id and slave_id <= num_slaves,
+           'master: slave id read error')
+    local master2slave = slave_pipes[slave_id]
+    if next_variant <= #variants then
+      local objfile = os.tmpname()
+      objfiles:insert(objfile)
+      pclog:info('master: assigning ' .. tostring(variants[next_variant]) ..
+                 ' to slave ' .. slave_id .. ', to be compiled to ' .. objfile)
+      master2slave:write_int(next_variant)
+      master2slave:write_string(objfile)
+      next_variant = next_variant + 1
+    else
+      pclog:info('master: sending stop command to slave ' .. slave_id)
+      master2slave:write_int(0)
+      master2slave:close_write_end()
+      num_stopped = num_stopped + 1
+    end
+  end
+  for slave_id,pid in ipairs(slave_pids) do
+    pclog:info('master: waiting for slave ' .. slave_id .. ' to finish')
+    c.waitpid(pid, nil, 0)
+  end
+  slave2master:close_read_end()
+
+  -- Declare all task wrappers using a (fake) header file, so the compiler will
+  -- expect them to be linked-in later.
+  local header = [[
+#include "legion.h"
+#include "legion_terra.h"
+#include "legion_terra_partitions.h"
+]] ..
+  table.concat(
+    variants:map(function(variant) return variant:wrapper_sig() .. '\n' end)
+  )
+  local task_wrappers = terralib.includecstring(header)
+
+  return objfiles,task_wrappers
+end
+
 function std.start(main_task, extra_setup_thunk)
   if std.config["pretty"] then os.exit() end
 
   assert(std.is_task(main_task))
-  local main = std.setup(main_task, extra_setup_thunk)
+  local objfiles,task_wrappers = compile_tasks_in_parallel()
+
+  -- If task wrappers were compiled on separate processes, link them all into a
+  -- dynamic library and load that.
+  if #objfiles > 0 then
+    local dylib = os.tmpname()
+    local cmd = os.getenv('CXX') or 'c++'
+    if os.execute('test "$(uname)" = Darwin') == 0 then
+      cmd = cmd .. ' -dynamiclib -single_module -undefined dynamic_lookup -fPIC'
+    else
+      cmd = cmd .. ' -shared -fPIC'
+    end
+    cmd = cmd .. ' -o ' .. dylib
+    for _,f in ipairs(objfiles) do
+      cmd = cmd .. ' ' .. f
+    end
+    assert(os.execute(cmd) == 0)
+    terralib.linklibrary(dylib)
+  end
+
+  local main = std.setup(main_task, extra_setup_thunk, task_wrappers)
 
   local args = std.args
   local argc = #args
@@ -3488,19 +3803,51 @@ function std.start(main_task, extra_setup_thunk)
     [argv_setup];
     return main([argc], [argv])
   end
+
+  profile('compile', nil, function() wrapper:compile() end)()
+
+  profile.print_summary()
+
   wrapper()
+end
+
+local function infer_filetype(filename)
+  if filename:match("%.o$") then
+    return "object"
+  elseif filename:match("%.bc$") then
+    return "bitcode"
+  elseif filename:match("%.ll$") then
+    return "llvmir"
+  elseif filename:match("%.so$") or filename:match("%.dylib$") or filename:match("%.dll$") then
+    return "sharedlibrary"
+  elseif filename:match("%.s") then
+    return "asm"
+  else
+    return "executable"
+  end
 end
 
 function std.saveobj(main_task, filename, filetype, extra_setup_thunk, link_flags)
   assert(std.is_task(main_task))
-  local main, names = std.setup(main_task, extra_setup_thunk)
+  filetype = filetype or infer_filetype(filename)
+  assert(not link_flags or filetype == 'sharedlibrary' or filetype == 'executable',
+         'Link flags are ignored unless saving to shared library or executable')
+
+  local objfiles,task_wrappers = compile_tasks_in_parallel()
+  if #objfiles > 0 then
+    assert(filetype == "object" or filetype == "executable",
+           'Parallel compilation only supported for object or executable output')
+  end
+
+  local main, names = std.setup(main_task, extra_setup_thunk, task_wrappers)
+
+  local flags = terralib.newlist()
+  flags:insertall(objfiles)
   local use_cmake = os.getenv("USE_CMAKE") == "1"
   local lib_dir = os.getenv("LG_RT_DIR") .. "/../bindings/regent"
   if use_cmake then
     lib_dir = os.getenv("CMAKE_BUILD_DIR") .. "/lib"
   end
-
-  local flags = terralib.newlist()
   if os.getenv('CRAYPE_VERSION') then
     flags:insert("-Wl,-Bdynamic")
   end
@@ -3519,11 +3866,28 @@ function std.saveobj(main_task, filename, filetype, extra_setup_thunk, link_flag
   if use_cmake then
     flags:insertall({"-llegion", "-lrealm"})
   end
-  if filetype ~= nil then
-    terralib.saveobj(filename, filetype, names, flags)
-  else
-    terralib.saveobj(filename, names, flags)
-  end
+
+  profile('compile', nil, function()
+    if #objfiles > 0 and filetype == 'object' then
+      -- Terra will not read the link flags in this case, to collect the code
+      -- that was compiled on different processes, so we have to combine all
+      -- the object files manually.
+      local mainobj = os.tmpname()
+      terralib.saveobj(mainobj, 'object', names)
+      local cmd = os.getenv('CXX') or 'c++'
+      cmd = cmd .. ' -Wl,-r'
+      cmd = cmd .. ' ' .. mainobj
+      for _,f in ipairs(objfiles) do
+        cmd = cmd .. ' ' .. f
+      end
+      cmd = cmd .. ' -o ' .. filename
+      cmd = cmd .. ' -nostdlib'
+      assert(os.execute(cmd) == 0)
+    else
+      terralib.saveobj(filename, filetype, names, flags)
+    end
+  end)()
+  profile.print_summary()
 end
 
 local function generate_task_interfaces()
@@ -3611,8 +3975,9 @@ end
 function std.save_tasks(header_filename, filename, filetype,
                        extra_setup_thunk, link_flags)
   assert(header_filename and filename)
+  local task_wrappers = make_task_wrappers()
   local registration_name, task_impl = write_header(header_filename)
-  local _, names = std.setup(nil, extra_setup_thunk, registration_name)
+  local _, names = std.setup(nil, extra_setup_thunk, task_wrappers, registration_name)
   local use_cmake = os.getenv("USE_CMAKE") == "1"
   local lib_dir = os.getenv("LG_RT_DIR") .. "/../bindings/regent"
   if use_cmake then
@@ -3630,11 +3995,14 @@ function std.save_tasks(header_filename, filename, filetype,
   if use_cmake then
     flags:insertall({"-llegion", "-lrealm"})
   end
-  if filetype ~= nil then
-    terralib.saveobj(filename, filetype, names, flags)
-  else
-    terralib.saveobj(filename, names, flags)
-  end
+  profile('compile', nil, function()
+    if filetype ~= nil then
+      terralib.saveobj(filename, filetype, names, flags)
+    else
+      terralib.saveobj(filename, names, flags)
+    end
+  end)()
+  profile.print_summary()
 end
 
 -- #####################################
@@ -3714,7 +4082,7 @@ end
 do
   local intrinsic_names = {}
   if os.execute("bash -c \"[ `uname` == 'Linux' ]\"") == 0 and
-    os.execute("grep POWER8 /proc/cpuinfo > /dev/null") == 0
+    os.execute("grep altivec /proc/cpuinfo > /dev/null") == 0
   then
     intrinsic_names[vector(float,  4)] = "llvm.ppc.altivec.v%sfp"
     intrinsic_names[vector(double, 2)] = "llvm.ppc.vsx.xv%sdp"

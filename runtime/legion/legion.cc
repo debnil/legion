@@ -958,7 +958,7 @@ namespace Legion {
       assert(reservation_lock.exists());
 #endif
       Internal::ApEvent lock_event(reservation_lock.acquire(mode,exclusive));
-      lock_event.lg_wait();
+      lock_event.wait();
     }
 
     //--------------------------------------------------------------------------
@@ -1084,7 +1084,7 @@ namespace Legion {
       assert(phase_barrier.exists());
 #endif
       Internal::ApEvent e = Internal::Runtime::get_previous_phase(*this);
-      e.lg_wait();
+      e.wait();
     }
 
     //--------------------------------------------------------------------------
@@ -1153,6 +1153,9 @@ namespace Legion {
     { 
       privilege_fields = priv_fields;
       instance_fields = inst_fields;
+      // For backwards compatibility with the old encoding
+      if (privilege == WRITE_PRIV)
+        privilege = WRITE_DISCARD;
 #ifdef DEBUG_LEGION
       if (IS_REDUCE(*this)) // Shouldn't use this constructor for reductions
         REPORT_LEGION_ERROR(ERROR_USE_REDUCTION_REGION_REQ, 
@@ -1175,6 +1178,9 @@ namespace Legion {
     { 
       privilege_fields = priv_fields;
       instance_fields = inst_fields;
+      // For backwards compatibility with the old encoding
+      if (privilege == WRITE_PRIV)
+        privilege = WRITE_DISCARD;
 #ifdef DEBUG_LEGION
       if (IS_REDUCE(*this))
         REPORT_LEGION_ERROR(ERROR_USE_REDUCTION_REGION_REQ, 
@@ -1197,6 +1203,9 @@ namespace Legion {
     {
       privilege_fields = priv_fields;
       instance_fields = inst_fields;
+      // For backwards compatibility with the old encoding
+      if (privilege == WRITE_PRIV)
+        privilege = WRITE_DISCARD;
 #ifdef DEBUG_LEGION
       if (IS_REDUCE(*this))
         REPORT_LEGION_ERROR(ERROR_USE_REDUCTION_REGION_REQ, 
@@ -1282,6 +1291,9 @@ namespace Legion {
         handle_type(SINGULAR)
     //--------------------------------------------------------------------------
     { 
+      // For backwards compatibility with the old encoding
+      if (privilege == WRITE_PRIV)
+        privilege = WRITE_DISCARD;
 #ifdef DEBUG_LEGION
       if (IS_REDUCE(*this)) // Shouldn't use this constructor for reductions
         REPORT_LEGION_ERROR(ERROR_USE_REDUCTION_REGION_REQ, 
@@ -1303,6 +1315,9 @@ namespace Legion {
         handle_type(PART_PROJECTION), projection(_proj)
     //--------------------------------------------------------------------------
     { 
+      // For backwards compatibility with the old encoding
+      if (privilege == WRITE_PRIV)
+        privilege = WRITE_DISCARD;
 #ifdef DEBUG_LEGION
       if (IS_REDUCE(*this))
         REPORT_LEGION_ERROR(ERROR_USE_REDUCTION_REGION_REQ, 
@@ -1324,6 +1339,9 @@ namespace Legion {
         handle_type(REG_PROJECTION), projection(_proj)
     //--------------------------------------------------------------------------
     {
+      // For backwards compatibility with the old encoding
+      if (privilege == WRITE_PRIV)
+        privilege = WRITE_DISCARD;
 #ifdef DEBUG_LEGION
       if (IS_REDUCE(*this))
         REPORT_LEGION_ERROR(ERROR_USE_REDUCTION_REGION_REQ, 
@@ -2294,6 +2312,15 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    bool Future::is_ready(void) const
+    //--------------------------------------------------------------------------
+    {
+      if (impl != NULL)
+        return impl->is_ready();
+      return true; // Empty futures are always ready
+    }
+
+    //--------------------------------------------------------------------------
     void* Future::get_untyped_result(bool silence_warnings) const
     //--------------------------------------------------------------------------
     {
@@ -3251,7 +3278,7 @@ namespace Legion {
                                    pointer_fid);
       }
       LogicalRegionT<1,coord_t> temp_lr = create_logical_region(ctx,
-                                                  temp_is, temp_fs);
+                                            temp_is, temp_fs, true);
       // Fill in the logical region with the data
       // Do this with a task launch to maintain deferred execution
       switch (color_space.get_dim())
@@ -3393,7 +3420,7 @@ namespace Legion {
                                    pointer_fid);
       }
       LogicalRegionT<1,coord_t> temp_lr = create_logical_region(ctx,
-                                                  temp_is, temp_fs);
+                                            temp_is, temp_fs, true);
       // Fill in the logical region with the data
       // Do this with a task launch to maintain deferred execution
       if (do_ranges)
@@ -3513,7 +3540,7 @@ namespace Legion {
         }
       }
       LogicalRegionT<1,coord_t> temp_lr = create_logical_region(ctx,
-                                                  temp_is, temp_fs);
+                                            temp_is, temp_fs, true);
       // Fill in the logical region with the data
       // Do this with a task launch to maintain deferred execution
       switch (color_dim)
@@ -3682,7 +3709,7 @@ namespace Legion {
         }
       }
       LogicalRegionT<1,coord_t> temp_lr = create_logical_region(ctx,
-                                                  temp_is, temp_fs);
+                                            temp_is, temp_fs, true);
       // Fill in the logical region with the data
       // Do this with a task launch to maintain deferred execution
       switch (range_dim)
@@ -3810,7 +3837,7 @@ namespace Legion {
         }
       }
       LogicalRegionT<1,coord_t> temp_lr = create_logical_region(ctx,
-                                                  temp_is, temp_fs);
+                                            temp_is, temp_fs, true);
       // Fill in the logical region with the data
       // Do this with a task launch to maintain deferred execution
       switch (color_dim)
@@ -3982,7 +4009,7 @@ namespace Legion {
         }
       }
       LogicalRegionT<1,coord_t> temp_lr = create_logical_region(ctx,
-                                                  temp_is, temp_fs);
+                                            temp_is, temp_fs, true);
       // Fill in the logical region with the data
       // Do this with a task launch to maintain deferred execution
       switch (range_dim)
@@ -5321,10 +5348,10 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     LogicalRegion Runtime::create_logical_region(Context ctx, 
-                                            IndexSpace index, FieldSpace fields)
+                           IndexSpace index, FieldSpace fields, bool task_local)
     //--------------------------------------------------------------------------
     {
-      return runtime->create_logical_region(ctx, index, fields);
+      return runtime->create_logical_region(ctx, index, fields, task_local);
     }
 
     //--------------------------------------------------------------------------
@@ -5975,10 +6002,10 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void Runtime::detach_external_resource(Context ctx, PhysicalRegion region)
+    Future Runtime::detach_external_resource(Context ctx, PhysicalRegion region)
     //--------------------------------------------------------------------------
     {
-      runtime->detach_external_resource(ctx, region);
+      return runtime->detach_external_resource(ctx, region);
     }
 
     //--------------------------------------------------------------------------
@@ -6415,6 +6442,13 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    MapperID Runtime::generate_library_mapper_ids(const char *name, size_t cnt)
+    //--------------------------------------------------------------------------
+    {
+      return runtime->generate_library_mapper_ids(name, cnt);
+    }
+
+    //--------------------------------------------------------------------------
     /*static*/ MapperID Runtime::generate_static_mapper_id(void)
     //--------------------------------------------------------------------------
     {
@@ -6441,6 +6475,14 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       return runtime->generate_dynamic_projection_id();
+    }
+
+    //--------------------------------------------------------------------------
+    ProjectionID Runtime::generate_library_projection_ids(const char *name,
+                                                          size_t count)
+    //--------------------------------------------------------------------------
+    {
+      return runtime->generate_library_projection_ids(name, count);
     }
 
     //--------------------------------------------------------------------------
@@ -6806,8 +6848,7 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    /*static*/ int Runtime::start(int argc, char **argv, 
-                                           bool background)
+    /*static*/ int Runtime::start(int argc, char **argv, bool background)
     //--------------------------------------------------------------------------
     {
       return Internal::Runtime::start(argc, argv, background);
@@ -6821,8 +6862,7 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    /*static*/ void Runtime::set_top_level_task_id(
-                                                  Processor::TaskFuncID top_id)
+    /*static*/ void Runtime::set_top_level_task_id(Processor::TaskFuncID top_id)
     //--------------------------------------------------------------------------
     {
       Internal::Runtime::set_top_level_task_id(top_id);
@@ -6887,14 +6927,18 @@ namespace Legion {
     /*static*/ const InputArgs& Runtime::get_input_args(void)
     //--------------------------------------------------------------------------
     {
-      return Internal::Runtime::get_input_args();
+      return Internal::implicit_runtime->input_args;
     }
 
     //--------------------------------------------------------------------------
     /*static*/ Runtime* Runtime::get_runtime(Processor p)
     //--------------------------------------------------------------------------
     {
-      return Internal::Runtime::get_runtime(p)->external;
+      // If we have an implicit runtime we use that
+      if (Internal::implicit_runtime != NULL)
+        return Internal::implicit_runtime->external;
+      // Otherwise this is not from a Legion task, so fallback to the_runtime
+      return Internal::Runtime::the_runtime->external;
     }
 
     //--------------------------------------------------------------------------
@@ -6929,6 +6973,13 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       return runtime->generate_dynamic_task_id();
+    }
+
+    //--------------------------------------------------------------------------
+    TaskID Runtime::generate_library_task_ids(const char *name, size_t count)
+    //--------------------------------------------------------------------------
+    {
+      return runtime->generate_library_task_ids(name, count);
     }
 
     //--------------------------------------------------------------------------
@@ -6978,9 +7029,6 @@ namespace Legion {
                                        Context& ctx, Runtime *& runtime)
     //--------------------------------------------------------------------------
     {
-      // Get the high level runtime
-      runtime = Runtime::get_runtime(p);
-
       // Read the context out of the buffer
 #ifdef DEBUG_LEGION
       assert(datalen == sizeof(Context));
@@ -6988,7 +7036,7 @@ namespace Legion {
       ctx = *((const Context*)data);
       task = ctx->get_task();
 
-      reg = &ctx->begin_task();
+      reg = &ctx->begin_task(runtime);
     }
 
     //--------------------------------------------------------------------------

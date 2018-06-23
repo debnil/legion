@@ -37,13 +37,11 @@ function ast.flatmap_node_continuation(fn, node)
       elseif continuing then
         local tmp = {}
         for k, child in pairs(node) do
-          if k ~= "node_type" then
+          if k ~= "node_type" and k ~= "node_id" then
             tmp[k] = continuation(child)
-            assert(not terralib.islist(tmp[k]) or
-                   terralib.islist(child) or
-                   child:is(ast.unspecialized.stat) or
-                   child:is(ast.specialized.stat) or
-                   child:is(ast.typed.stat),
+            local is_src_list = terralib.islist(child)
+            local is_dst_list = terralib.islist(tmp[k])
+            assert((is_src_list and is_dst_list) or (not is_src_list and not is_dst_list),
                    "flatmap only flattens a list of statements")
           end
         end
@@ -66,6 +64,34 @@ function ast.flatmap_node_continuation(fn, node)
   return continuation(node)
 end
 
+function ast.flatmap_node_postorder(fn, node)
+  if ast.is_node(node) then
+    local tmp = {}
+    for k, child in pairs(node) do
+       if k ~= "node_type" and k ~= "node_id" then
+        tmp[k] = ast.flatmap_node_postorder(fn, child)
+        local is_src_list = terralib.islist(child)
+        local is_dst_list = terralib.islist(tmp[k])
+        assert((is_src_list and is_dst_list) or (not is_src_list and not is_dst_list),
+               "flatmap only flattens a list of statements")
+      end
+    end
+    return fn(node(tmp))
+  elseif terralib.islist(node) then
+    local tmp = terralib.newlist()
+    for _, child in ipairs(node) do
+      local child = ast.flatmap_node_postorder(fn, child)
+      if terralib.islist(child) then
+        tmp:insertall(child)
+      else
+        tmp:insert(child)
+      end
+    end
+    return tmp
+  end
+  return node
+end
+
 -- Annotation
 
 ast:inner("annotation")
@@ -80,7 +106,8 @@ ast.annotation:leaf("Unroll", {"value"}, true)
 
 -- Annotation: Sets
 ast.annotation:leaf("Set", {"cuda", "external", "inline", "inner", "leaf",
-                            "openmp", "parallel", "spmd", "trace", "vectorize"},
+                            "openmp", "optimize", "parallel", "spmd", "trace",
+                            "vectorize"},
                     false, true)
 
 function ast.default_annotations()
@@ -92,6 +119,7 @@ function ast.default_annotations()
     inner = allow,
     leaf = allow,
     openmp = allow,
+    optimize = allow,
     parallel = allow,
     spmd = allow,
     trace = allow,
@@ -491,7 +519,7 @@ ast.typed.stat:leaf("IndexLaunchNum", {"symbol", "values", "preamble", "call",
 ast.typed.stat:leaf("IndexLaunchList", {"symbol", "value", "preamble", "call",
                                         "reduce_lhs", "reduce_op",
                                         "args_provably"})
-ast:leaf("IndexLaunchArgsProvably", {"invariant", "variant"})
+ast:leaf("IndexLaunchArgsProvably", {"invariant", "projectable"})
 ast.typed.stat:leaf("Var", {"symbol", "type", "value"})
 ast.typed.stat:leaf("VarUnpack", {"symbols", "fields", "field_types", "value"})
 ast.typed.stat:leaf("Return", {"value"})

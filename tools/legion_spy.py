@@ -51,11 +51,12 @@ DEPENDENCE_TYPES = [
 "simultaneous",
 ]
 
-NO_ACCESS  = 0x00000000
-READ_ONLY  = 0x00000001
-READ_WRITE = 0x00000007
-WRITE_ONLY = 0x00000002
-REDUCE     = 0x00000004
+NO_ACCESS     = 0x00000000
+READ_ONLY     = 0x00000001
+READ_WRITE    = 0x00000007
+WRITE_ONLY    = 0x10000002
+WRITE_DISCARD = 0x10000007
+REDUCE        = 0x00000004
 
 EXCLUSIVE = 0
 ATOMIC = 1
@@ -2289,11 +2290,13 @@ class IndexPartition(object):
         # Check for dominance of children by parent
         for child in self.children.itervalues():
             if not self.parent.dominates(child):
-                print(('WARNING: child % is not dominated by parent %s in %s. '+
+                print(('WARNING: child %s is not dominated by parent %s in %s. '+
                       'This is definitely an application bug.') %
                       (child, self.parent, self))
                 if self.state.assert_on_warning:
                     assert False
+            # Recurse down the tree too
+            child.check_partition_properties()
         # Check disjointness
         if self.disjoint:
             previous = PointSet()
@@ -3388,7 +3391,7 @@ class LogicalState(object):
                 # If we're going to do a write discard then
                 # this can be a read only close, but only if
                 # the operation is not predicated and it dominates
-                overwrite = req.priv == WRITE_ONLY and not op.predicate and \
+                overwrite = req.priv == WRITE_DISCARD and not op.predicate and \
                                req.logical_node.dominates(self.node)
                 for child,open_mode in self.open_children.iteritems():
                     if open_mode == OPEN_READ_ONLY:                
@@ -3742,7 +3745,7 @@ class LogicalState(object):
             if not still_dirty:
                 for privilege in self.open_children.itervalues():
                     if privilege == READ_WRITE or privilege == REDUCE or \
-                        privilege == WRITE_ONLY:
+                        privilege == WRITE_DISCARD:
                           still_dirty = True
                           break
             if not still_dirty:
@@ -4749,16 +4752,17 @@ class Requirement(object):
 
     def has_write(self):
         return (self.priv == READ_WRITE) or (self.priv == REDUCE) or \
-                (self.priv == WRITE_ONLY)
+                (self.priv == WRITE_DISCARD) or (self.priv == WRITE_ONLY)
 
     def is_write(self):
-        return (self.priv == READ_WRITE) or (self.priv == WRITE_ONLY)
+        return (self.priv == READ_WRITE) or (self.priv == WRITE_DISCARD) or \
+                (self.priv == WRITE_ONLY)
 
     def is_read_write(self):
         return self.priv == READ_WRITE
 
     def is_write_only(self):
-        return self.priv == WRITE_ONLY
+        return self.priv == WRITE_DISCARD or self.priv == WRITE_ONLY
 
     def is_reduce(self):
         return self.priv == REDUCE
@@ -4796,6 +4800,8 @@ class Requirement(object):
             return "READ-ONLY"
         elif self.priv == READ_WRITE:
             return "READ-WRITE"
+        elif self.priv == WRITE_DISCARD:
+            return "WRITE-DISCARD"
         elif self.priv == WRITE_ONLY:
             return "WRITE-ONLY"
         else:
@@ -5759,6 +5765,13 @@ class Operation(object):
         for idx in range(0,len(self.reqs)):
             if not self.analyze_logical_requirement(idx, perform_checks):
                 return False
+        # Perform any updates to the restricted state for our context 
+        if not self.update_context_restrictions():
+            return False
+        return True
+
+    def update_context_restrictions(self):
+        assert self.context is not None
         # See if our operation had any bearing on the restricted
         # properties of the enclosing context
         if self.kind == ACQUIRE_OP_KIND:
@@ -6079,7 +6092,7 @@ class Operation(object):
                 return False
         return True
 
-    def perform_op_physical_verification(self, perform_checks):
+    def perform_op_physical_verification(self, perform_checks, need_restrict_analysis):
         # If we were predicated false, then there is nothing to do
         if not self.predicate_result:
             return True
@@ -6088,6 +6101,14 @@ class Operation(object):
             depth = self.context.get_depth()
             for idx in range(depth):
                 prefix += '  '
+            # Since we have a context, see if we have to do our restriction analysis
+            if need_restrict_analysis:
+                if self.reqs is not None:
+                    for idx in range(0,len(self.reqs)):
+                        self.context.check_restricted_coherence(self, self.reqs[idx])
+                # Do our updates to the restricted set
+                if not self.update_context_restrictions():
+                    return False
         # If we have any internal operations (e.g. close operations, then
         # see if they performed any physical analysis
         if self.inter_close_ops:
@@ -6096,17 +6117,20 @@ class Operation(object):
             for close in self.inter_close_ops:
                 if close.kind == READ_ONLY_CLOSE_OP_KIND:
                     continue
-                if not close.perform_op_physical_verification(perform_checks):
+                if not close.perform_op_physical_verification(perform_checks, 
+                                                              need_restrict_analysis):
                     return False
         # If we are an index space task, only do our points
         if self.kind == INDEX_TASK_KIND:
             for point in sorted(self.points.itervalues(), key=lambda x: x.op.uid):
-                if not point.op.perform_op_physical_verification(perform_checks):
+                if not point.op.perform_op_physical_verification(perform_checks,
+                                                                 need_restrict_analysis):
                     return False
             return True
         elif self.points: # Handle other index space operations too
             for point in sorted(self.points.itervalues(), key=lambda x: x.uid):
-                if not point.perform_op_physical_verification(perform_checks):
+                if not point.perform_op_physical_verification(perform_checks,
+                                                              need_restrict_analysis):
                     return False
             return True
         print((prefix+"Performing physical verification analysis "+
@@ -6121,7 +6145,8 @@ class Operation(object):
             # Check to see if this is an index copy
             if self.points:
                 for point in sorted(self.points.itervalues(), key=lambda x: x.uid):
-                    if not point.perform_op_physical_verification(perform_checks):
+                    if not point.perform_op_physical_verification(perform_checks, 
+                                                                  need_restrict_analysis):
                         return False
                 return True
             # Compute our version numbers first
@@ -6137,7 +6162,8 @@ class Operation(object):
             # Check to see if this is an index fill
             if self.points:
                 for point in sorted(self.points.itervalues(), key=lambda x: x.uid):
-                    if not point.perform_op_physical_verification(perform_checks):
+                    if not point.perform_op_physical_verification(perform_checks,
+                                                                  need_restrict_analysis):
                         return False
                 return True
             # Compute our version numbers first
@@ -6148,7 +6174,8 @@ class Operation(object):
         elif self.kind == DEP_PART_OP_KIND and self.points:
             # Index partition operation
             for point in sorted(self.points.itervalues(), key=lambda x: x.uid):
-                if not point.perform_op_physical_verification(perform_checks):
+                if not point.perform_op_physical_verification(perform_checks,
+                                                              need_restrict_analysis):
                     return False
             return True
         elif self.kind == DELETION_OP_KIND:
@@ -6172,7 +6199,8 @@ class Operation(object):
                             return False
                 # If we are not a leaf task, go down the task tree
                 if self.task is not None:
-                    if not self.task.perform_task_physical_verification(perform_checks):
+                    if not self.task.perform_task_physical_verification(perform_checks,
+                                                                need_restrict_analysis):
                         return False
         self.check_for_unanalyzed_realm_ops(perform_checks)
         # Clean up our reachable cache
@@ -6723,7 +6751,6 @@ class Task(object):
                     for field in req.fields:
                         assert field.fid in mapping 
                         inst = mapping[field.fid]
-                        # If they virtual mapped then there is no way
                         self.restrictions.append(
                             Restriction(req.logical_node, field, inst))
         # Iterate over all the operations in order and
@@ -6929,7 +6956,7 @@ class Task(object):
         # up the task tree so just give it depth zero
         return 0
 
-    def perform_task_physical_verification(self, perform_checks):
+    def perform_task_physical_verification(self, perform_checks, need_restrict_analysis):
         if not self.operations:
             return True
         # Depth is a proxy for context 
@@ -6944,15 +6971,26 @@ class Task(object):
                     continue
                 assert idx in self.op.mappings
                 mappings = self.op.mappings[idx]
+                # If we are doing restricted analysis then add any restrictions
+                add_restrictions = need_restrict_analysis and \
+                        (req.priv == READ_WRITE or req.priv == READ_ONLY) and \
+                        req.coher == SIMULTANEOUS
+                if add_restrictions and not self.restrictions:
+                    self.restrictions = list()
                 for field in req.fields:
                     assert field.fid in mappings
                     inst = mappings[field.fid]
                     if inst.is_virtual():
+                        assert not add_restrictions # Better not be virtual if restricted
                         continue
                     req.logical_node.initialize_verification_state(depth, field, inst)
+                    if add_restrictions:
+                        self.restrictions.append(
+                                Restriction(req.logical_node, field, inst))
         success = True
         for op in self.operations:
-            if not op.perform_op_physical_verification(perform_checks):
+            if not op.perform_op_physical_verification(perform_checks, 
+                                                       need_restrict_analysis):
                 success = False
                 break
         # Reset any physical user lists at our depth
@@ -6966,7 +7004,7 @@ class Task(object):
         for op in self.operations:
             op.print_op_mapping_decisions(depth)
 
-    def print_dataflow_graph(self, path, simplify_graphs):
+    def print_dataflow_graph(self, path, simplify_graphs, zoom_graphs):
         if len(self.operations) == 0:
             return 0
         if len(self.operations) == 1:
@@ -7036,7 +7074,7 @@ class Task(object):
             previous_pairs = set()
             for op in self.operations:
                 op.print_incoming_dataflow_edges(printer, previous_pairs)
-        printer.print_pdf_after_close(False)
+        printer.print_pdf_after_close(False, zoom_graphs)
         # We printed our dataflow graph
         return 1   
 
@@ -7265,16 +7303,17 @@ class PointUser(object):
 
     def has_write(self):
         return (self.priv == READ_WRITE) or (self.priv == REDUCE) or \
-                (self.priv == WRITE_ONLY)
+                (self.priv == WRITE_DISCARD) or (self.priv == WRITE_ONLY)
 
     def is_write(self):
-        return (self.priv == READ_WRITE) or (self.priv == WRITE_ONLY)
+        return (self.priv == READ_WRITE) or (self.priv == WRITE_DISCARD) or \
+                (self.priv == WRITE_ONLY)
 
     def is_read_write(self):
         return self.priv == READ_WRITE
 
     def is_write_only(self):
-        return self.priv == WRITE_ONLY
+        return self.priv == WRITE_DISCARD or self.priv == WRITE_ONLY
 
     def is_reduce(self):
         return self.priv == REDUCE
@@ -7422,16 +7461,17 @@ class InstanceUser(object):
 
     def has_write(self):
         return (self.priv == READ_WRITE) or (self.priv == REDUCE) or \
-                (self.priv == WRITE_ONLY)
+                (self.priv == WRITE_DISCARD) or (self.priv == WRITE_ONLY)
 
     def is_write(self):
-        return (self.priv == READ_WRITE) or (self.priv == WRITE_ONLY)
+        return (self.priv == READ_WRITE) or (self.priv == WRITE_DISCARD) or \
+                (self.priv == WRITE_ONLY)
 
     def is_read_write(self):
         return self.priv == READ_WRITE
 
     def is_write_only(self):
-        return self.priv == WRITE_ONLY
+        return self.priv == WRITE_DISCARD or self.priv == WRITE_ONLY
 
     def is_reduce(self):
         return self.priv == REDUCE
@@ -8476,7 +8516,8 @@ class PhysicalTraverser(object):
 
 
 class GraphPrinter(object):
-    __slots__ = ['name', 'filename', 'out', 'depth', 'next_cluster_id']
+    # Static member so we only issue this warning once
+    zoom_warning = True
     def __init__(self,path,name,direction='LR'):
         self.name = name
         self.filename = path+name+'.dot'
@@ -8499,7 +8540,7 @@ class GraphPrinter(object):
         self.out.close()
         return self.filename
 
-    def print_pdf_after_close(self, simplify):
+    def print_pdf_after_close(self, simplify, zoom_graph=False):
         dot_file = self.close()
         pdf_file = self.name+".pdf"
         #svg_file = self.name+".svg"
@@ -8522,6 +8563,80 @@ class GraphPrinter(object):
         except:
             print("WARNING: DOT failure, image for graph "+str(self.name)+" not generated")
             subprocess.call(['rm', '-f', 'core', pdf_file])
+        # If we are making a zoom graph, then make a directory with the appropriate name
+        if zoom_graph:
+            try:
+                import pydot
+                # Make a directory to put this in 
+                zoom_dir = 'zoom_'+self.name
+                os.mkdir(zoom_dir)
+                # Rest of this is courtesy of @manopapad
+                nodes = {} # map(string,Node)
+                in_edges = {} # map(string,set(Edge))
+                out_edges = {} # map(string,set(Edge))
+                def collect_nodes_edges(g):
+                    for sub in g.get_subgraphs():
+                        collect_nodes_edges(sub)
+                    for n in g.get_nodes():
+                        if n.get_style() == 'invis':
+                            # HACK: Assuming invisible nodes aren't connected to anything
+                            continue
+                        assert(n.get_name() not in nodes)
+                        nodes[n.get_name()] = n
+                        n.set_URL(n.get_name() + '.svg')
+                        in_edges[n.get_name()] = set()
+                        out_edges[n.get_name()] = set()
+                    for e in g.get_edges():
+                        out_edges[e.get_source()].add(e)
+                        in_edges[e.get_destination()].add(e)
+
+                # Support both older and newer versions of pydot library
+                # See pydot issue 159 on github:
+                # https://github.com/erocarrera/pydot/issues/159
+                graphs = pydot.graph_from_dot_file(self.filename)
+                if type(graphs) == list:
+                    # This is the common path
+                    assert len(graphs) == 1
+                    g = graphs[0]
+                else:
+                    # This is the deprecated path
+                    g = graphs
+                collect_nodes_edges(g)
+
+                g.write_svg(zoom_dir + '/zoom.svg')
+                g.write_cmap(zoom_dir + '/zoom.map')
+                g.write_png(zoom_dir + '/zoom.png')
+                with open(zoom_dir+'/index.html', 'w') as f:
+                    f.write('<!DOCTYPE html>\n')
+                    f.write('<html>\n')
+                    f.write('<head></head>\n')
+                    f.write('<body>\n')
+                    f.write('<img src="zoom.png" usemap="#mainmap"/>\n')
+                    f.write('<map id="mainmap" name="mainmap">\n')
+                    with open(zoom_dir+'/zoom.map', 'r') as f_map:
+                        for line in f_map:
+                            f.write(line)
+                    f.write('</map>\n')
+                    f.write('</body>\n')
+                    f.write('</html>\n')
+
+                for n in nodes.values():
+                    sub = pydot.Dot()
+                    sub.obj_dict['attributes'] = g.get_attributes()
+                    sub.add_node(n)
+                    for e in out_edges[n.get_name()]:
+                        dst = nodes[e.get_destination()]
+                        sub.add_node(dst)
+                        sub.add_edge(e)
+                    for e in in_edges[n.get_name()]:
+                        src = nodes[e.get_source()]
+                        sub.add_node(src)
+                        sub.add_edge(e)
+                    sub.write_svg(zoom_dir + '/' + n.get_name() + '.svg')
+            except ImportError:
+                if self.zoom_warning:
+                    print("WARNING: Unable to make zoom plots because the package pydot is not installed")
+                    GraphPrinter.zoom_warning = False
 
     def up(self):
         assert self.depth > 0
@@ -10065,11 +10180,11 @@ class State(object):
                     return False 
         return True
 
-    def perform_physical_analysis(self, perform_checks, sanity_checks):
+    def perform_physical_analysis(self, perform_checks, sanity_checks, need_restrict_analysis):
         assert self.top_level_uid is not None
         top_task = self.get_task(self.top_level_uid)
         # Perform the physical analysis on all the operations in program order
-        if not top_task.perform_task_physical_verification(perform_checks):
+        if not top_task.perform_task_physical_verification(perform_checks, need_restrict_analysis):
             print("FAIL")
             return
         print("Pass")
@@ -10123,14 +10238,14 @@ class State(object):
             mem.print_mem_edges(machine_printer)
         machine_printer.print_pdf_after_close(False)
 
-    def make_dataflow_graphs(self, path, simplify_graphs):
+    def make_dataflow_graphs(self, path, simplify_graphs, zoom_graphs):
         total_dataflow_graphs = 0
         for task in self.tasks.itervalues():
-            total_dataflow_graphs += task.print_dataflow_graph(path, simplify_graphs)
+            total_dataflow_graphs += task.print_dataflow_graph(path, simplify_graphs, zoom_graphs)
         if self.verbose:
             print("Made "+str(total_dataflow_graphs)+" dataflow graphs")
 
-    def make_event_graph(self, path):
+    def make_event_graph(self, path, zoom_graphs):
         # we print these recursively so we can see the hierarchy
         assert self.top_level_uid is not None
         op = self.get_operation(self.top_level_uid)
@@ -10142,7 +10257,7 @@ class State(object):
         # Now print the edges at the very end
         for node in all_nodes:
             node.print_incoming_event_edges(printer) 
-        printer.print_pdf_after_close(False)
+        printer.print_pdf_after_close(False, zoom_graphs)
 
     def print_realm_statistics(self):
         print('Total events: '+str(len(self.events)))
@@ -10610,6 +10725,9 @@ def main(temp_dir):
         '--assert-warning', dest='assert_on_warning', action='store_true',
         help='assert on warnings (implies -a)')
     parser.add_argument(
+        '--zoom', dest='zoom_graphs', action='store_true',
+        help='enable generation of "zoom" graphs for all emitted graphs')
+    parser.add_argument(
         dest='filenames', nargs='+',
         help='input legion spy log filenames')
     args = parser.parse_args()
@@ -10637,6 +10755,7 @@ def main(temp_dir):
     assert_on_error = args.assert_on_error or args.assert_on_warning
     assert_on_warning = args.assert_on_warning
     test_geometry = args.test_geometry
+    zoom_graphs = args.zoom_graphs
 
     if test_geometry:
         run_geometry_tests()
@@ -10698,6 +10817,7 @@ def main(temp_dir):
     # If we are doing logical checks or the user asked for the dataflow
     # graph but we don't have any logical data then perform the logical analysis
     need_logical = dataflow_graphs and not state.detailed_logging 
+    need_restrict_analysis = True 
     if logical_checks or need_logical:
         if need_logical:
             print("INFO: No logical dependence data was found so we are running "+
@@ -10705,6 +10825,8 @@ def main(temp_dir):
                   "should compute. These are not the actual dataflow graphs computed.")
         print("Performing logical analysis...")
         state.perform_logical_analysis(logical_checks, sanity_checks)
+        # No longer need to do restriction analysis if we do it during logical
+        need_restrict_analysis = False
     # If we are doing physical checks or the user asked for the event
     # graph but we don't have any logical data then perform the physical analysis
     need_physical = event_graphs and not state.detailed_logging 
@@ -10714,7 +10836,7 @@ def main(temp_dir):
                   "physical analysis to show the event graph that the runtime "+
                   "should compute. This is not the actual event graph computed.")
         print("Performing physical analysis...")
-        state.perform_physical_analysis(physical_checks, sanity_checks)
+        state.perform_physical_analysis(physical_checks, sanity_checks, need_restrict_analysis)
         # If we generated the graph for printing, then simplify it 
         if need_physical:
             state.simplify_physical_graph(need_cycle_check=False)
@@ -10732,10 +10854,10 @@ def main(temp_dir):
         state.make_machine_graphs(temp_dir)
     if dataflow_graphs:
         print("Making dataflow graphs...")
-        state.make_dataflow_graphs(temp_dir, simplify_graphs)
+        state.make_dataflow_graphs(temp_dir, simplify_graphs, zoom_graphs)
     if event_graphs:
         print("Making event graphs...")
-        state.make_event_graph(temp_dir)
+        state.make_event_graph(temp_dir, zoom_graphs)
     if realm_stats:
         print("Printing Realm statistics...")
         state.print_realm_statistics()

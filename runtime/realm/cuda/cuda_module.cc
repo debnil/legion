@@ -460,6 +460,161 @@ namespace Realm {
 		       (long)depth, kind);
     }
 
+
+  ////////////////////////////////////////////////////////////////////////
+  //
+  // class GPUMemset1D
+
+    GPUMemset1D::GPUMemset1D(GPU *_gpu,
+		  void *_dst, size_t _bytes,
+		  const void *_fill_data, size_t _fill_data_size,
+		  GPUCompletionNotification *_notification)
+      : GPUMemcpy(_gpu, GPU_MEMCPY_DEVICE_TO_DEVICE)
+      , dst(_dst), bytes(_bytes)
+      , fill_data_size(_fill_data_size)
+      , notification(_notification)
+    {
+      if(fill_data_size <= MAX_DIRECT_SIZE) {
+	memcpy(&fill_data.direct, _fill_data, fill_data_size);
+      } else {
+	fill_data.indirect = malloc(fill_data_size);
+	assert(fill_data.indirect != 0);
+	memcpy(fill_data.indirect, _fill_data, fill_data_size);
+      }
+    }
+
+    GPUMemset1D::~GPUMemset1D(void)
+    {
+      if(fill_data_size > MAX_DIRECT_SIZE)
+	free(fill_data.indirect);
+    }
+
+    void GPUMemset1D::execute(GPUStream *stream)
+    {
+      DetailedTimer::ScopedPush sp(TIME_COPY);
+      log_gpudma.info("gpu memset: dst=%p bytes=%zd fill_data_size=%zd",
+		      dst, bytes, fill_data_size);
+
+      CUstream raw_stream = stream->get_stream();
+
+      switch(fill_data_size) {
+      case 1:
+	{
+	  CHECK_CU( cuMemsetD8Async(CUdeviceptr(dst), 
+				    *reinterpret_cast<const unsigned char *>(&fill_data.direct),
+				    bytes,
+				    raw_stream) );
+	  break;
+	}
+      case 2:
+	{
+	  CHECK_CU( cuMemsetD16Async(CUdeviceptr(dst), 
+				     *reinterpret_cast<const unsigned short *>(&fill_data.direct),
+				     bytes >> 1,
+				     raw_stream) );
+	  break;
+	}
+      case 4:
+	{
+	  CHECK_CU( cuMemsetD32Async(CUdeviceptr(dst), 
+				     *reinterpret_cast<const unsigned int *>(&fill_data.direct),
+				     bytes >> 2,
+				     raw_stream) );
+	  break;
+	}
+      default:
+	{
+	  log_gpudma.fatal() << "fill data size of " << fill_data_size
+			     << " not yet supported!";
+	  assert(0);
+	}
+      }
+      
+      if(notification)
+	stream->add_notification(notification);
+
+      log_gpudma.info("gpu memset complete: dst=%p bytes=%zd fill_data_size=%zd",
+		      dst, bytes, fill_data_size);
+    }
+
+  ////////////////////////////////////////////////////////////////////////
+  //
+  // class GPUMemset2D
+
+    GPUMemset2D::GPUMemset2D(GPU *_gpu,
+			     void *_dst, size_t _stride,
+			     size_t _bytes, size_t _lines,
+			     const void *_fill_data, size_t _fill_data_size,
+			     GPUCompletionNotification *_notification)
+      : GPUMemcpy(_gpu, GPU_MEMCPY_DEVICE_TO_DEVICE)
+      , dst(_dst), dst_stride(_stride)
+      , bytes(_bytes), lines(_lines)
+      , fill_data_size(_fill_data_size)
+      , notification(_notification)
+    {
+      if(fill_data_size <= MAX_DIRECT_SIZE) {
+	memcpy(&fill_data.direct, _fill_data, fill_data_size);
+      } else {
+	fill_data.indirect = malloc(fill_data_size);
+	assert(fill_data.indirect != 0);
+	memcpy(fill_data.indirect, _fill_data, fill_data_size);
+      }
+    }
+
+    GPUMemset2D::~GPUMemset2D(void)
+    {
+      if(fill_data_size > MAX_DIRECT_SIZE)
+	free(fill_data.indirect);
+    }
+
+    void GPUMemset2D::execute(GPUStream *stream)
+    {
+      DetailedTimer::ScopedPush sp(TIME_COPY);
+      log_gpudma.info("gpu memset 2d: dst=%p dst_odd=%ld bytes=%zd lines=%zd fill_data_size=%zd",
+		      dst, dst_stride, bytes, lines, fill_data_size);
+
+      CUstream raw_stream = stream->get_stream();
+
+      switch(fill_data_size) {
+      case 1:
+	{
+	  CHECK_CU( cuMemsetD2D8Async(CUdeviceptr(dst), dst_stride,
+				      *reinterpret_cast<const unsigned char *>(&fill_data.direct),
+				      bytes, lines,
+				      raw_stream) );
+	  break;
+	}
+      case 2:
+	{
+	  CHECK_CU( cuMemsetD2D16Async(CUdeviceptr(dst), dst_stride,
+				       *reinterpret_cast<const unsigned short *>(&fill_data.direct),
+				       bytes >> 1, lines,
+				       raw_stream) );
+	  break;
+	}
+      case 4:
+	{
+	  CHECK_CU( cuMemsetD2D32Async(CUdeviceptr(dst), dst_stride,
+				       *reinterpret_cast<const unsigned int *>(&fill_data.direct),
+				       bytes >> 2, lines,
+				       raw_stream) );
+	  break;
+	}
+      default:
+	{
+	  log_gpudma.fatal() << "fill data size of " << fill_data_size
+			     << " not yet supported!";
+	  assert(0);
+	}
+      }
+      
+      if(notification)
+	stream->add_notification(notification);
+
+      log_gpudma.info("gpu memset 2d complete: dst=%p dst_odd=%ld bytes=%zd lines=%zd fill_data_size=%zd",
+		      dst, dst_stride, bytes, lines, fill_data_size);
+    }
+
     ////////////////////////////////////////////////////////////////////////
     //
     // mem pair copiers for DMA channels
@@ -1338,6 +1493,54 @@ namespace Realm {
       peer_to_peer_stream->add_copy(copy);
     }
 
+    static size_t reduce_fill_size(const void *fill_data, size_t fill_data_size)
+    {
+      const char *as_char = reinterpret_cast<const char *>(fill_data);
+      // try powers of 2 up to 128 bytes
+      for(size_t step = 1; step <= 128; step <<= 1) {
+	bool ok = (fill_data_size % step) == 0;  // must divide evenly
+	for(size_t pos = step; ok && (pos < fill_data_size); pos += step)
+	  for(size_t i = 0; i < step; i++)
+	    if(as_char[pos + i] != as_char[pos + i - step]) {
+	      ok = false;
+	      break;
+	    }
+	if(ok)
+	  return step;
+      }
+      // no attempt to optimize non-power-of-2 repeat patterns right now
+      return fill_data_size;
+    }
+
+    void GPU::fill_within_fb(off_t dst_offset,
+			     size_t bytes,
+			     const void *fill_data, size_t fill_data_size,
+			     GPUCompletionNotification *notification /*= 0*/)
+    {
+      GPUMemcpy *copy = new GPUMemset1D(this,
+					(void *)(fbmem->base + dst_offset),
+					bytes,
+					fill_data,
+					reduce_fill_size(fill_data, fill_data_size),
+					notification);
+      device_to_device_stream->add_copy(copy);
+    }
+
+    void GPU::fill_within_fb_2d(off_t dst_offset, off_t dst_stride,
+				size_t bytes, size_t lines,
+				const void *fill_data, size_t fill_data_size,
+				GPUCompletionNotification *notification /*= 0*/)
+    {
+      GPUMemcpy *copy = new GPUMemset2D(this,
+					(void *)(fbmem->base + dst_offset),
+					dst_stride,
+					bytes, lines,
+					fill_data,
+					reduce_fill_size(fill_data, fill_data_size),
+					notification);
+      device_to_device_stream->add_copy(copy);
+    }
+
     void GPU::fence_to_fb(Realm::Operation *op)
     {
       GPUWorkFence *f = new GPUWorkFence(op);
@@ -1670,6 +1873,25 @@ namespace Realm {
       return ThreadLocal::current_gpu_proc;
     }
 
+    void GPUProcessor::push_call_configuration(dim3 grid_dim, dim3 block_dim,
+                                               size_t shared_size, void *stream)
+    {
+      call_configs.push_back(CallConfig(grid_dim, block_dim,
+                                        shared_size, (cudaStream_t)stream));
+    }
+
+    void GPUProcessor::pop_call_configuration(dim3 *grid_dim, dim3 *block_dim,
+                                              size_t *shared_size, void *stream)
+    {
+      assert(!call_configs.empty());
+      const CallConfig &config = call_configs.back();
+      *grid_dim = config.grid;
+      *block_dim = config.block;
+      *shared_size = config.shared;
+      *((cudaStream_t*)stream) = config.stream;
+      call_configs.pop_back();
+    }
+
     void GPUProcessor::stream_synchronize(cudaStream_t stream)
     {
       // same as device_synchronize for now
@@ -1761,6 +1983,11 @@ namespace Realm {
       : grid(_grid), block(_block), shared(_shared)
     {}
 
+    GPUProcessor::CallConfig::CallConfig(dim3 _grid, dim3 _block, 
+                                         size_t _shared, cudaStream_t _stream)
+      : LaunchConfig(_grid, _block, _shared), stream(_stream)
+    {}
+
     void GPUProcessor::configure_call(dim3 grid_dim,
 				      dim3 block_dim,
 				      size_t shared_mem,
@@ -1812,6 +2039,28 @@ namespace Realm {
 
       // clear out the kernel args
       kernel_args.clear();
+    }
+
+    void GPUProcessor::launch_kernel(const void *func,
+                                     dim3 grid_dim,
+                                     dim3 block_dim,
+                                     void **args,
+                                     size_t shared_memory,
+                                     cudaStream_t stream)
+    {
+      // Find our function
+      CUfunction f = gpu->lookup_function(func);
+
+      CUstream raw_stream = gpu->get_current_task_stream()->get_stream();
+      log_stream.debug() << "kernel " << func << " added to stream " << raw_stream;
+
+      // Launch the kernel on our stream dammit!
+      CHECK_CU( cuLaunchKernel(f,
+                               grid_dim.x, grid_dim.y, grid_dim.z,
+                               block_dim.x, block_dim.y, block_dim.z,
+                               shared_memory,
+                               raw_stream,
+                               args, NULL) );
     }
 
     void GPUProcessor::gpu_memcpy(void *dst, const void *src, size_t size,
@@ -2007,7 +2256,7 @@ namespace Realm {
 	  AutoGPUContext agc(this);
 	  CHECK_CU( cuCtxEnablePeerAccess((*it)->context, 0) );
 	}
-	log_gpu.print() << "peer access enabled from GPU " << p << " to FB " << (*it)->fbmem->me;
+	log_gpu.info() << "peer access enabled from GPU " << p << " to FB " << (*it)->fbmem->me;
 	peer_fbs.insert((*it)->fbmem->me);
 
 	{
@@ -2241,11 +2490,11 @@ namespace Realm {
 	  info->index = i;
 	  CHECK_CU( cuDeviceGet(&info->device, i) );
 	  CHECK_CU( cuDeviceGetName(info->name, GPUInfo::MAX_NAME_LEN, info->device) );
-	  CHECK_CU( cuDeviceComputeCapability(&info->compute_major,
-					      &info->compute_minor,
-					      info->device) );
+          CHECK_CU( cuDeviceGetAttribute(&info->compute_major,
+                         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, info->device) );
+          CHECK_CU( cuDeviceGetAttribute(&info->compute_minor,
+                         CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, info->device) );
 	  CHECK_CU( cuDeviceTotalMem(&info->total_mem, info->device) );
-	  CHECK_CU( cuDeviceGetProperties(&info->props, info->device) );
 
 	  log_gpu.info() << "GPU #" << i << ": " << info->name << " ("
 			 << info->compute_major << '.' << info->compute_minor

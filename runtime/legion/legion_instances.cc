@@ -178,7 +178,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
-      assert(Runtime::legion_spy_enabled);
+      assert(implicit_runtime->legion_spy_enabled);
 #endif
       std::vector<FieldID> fields;  
       owner->get_field_ids(allocated_fields, fields);
@@ -494,11 +494,7 @@ namespace Legion {
     {
       if (region_node != NULL)
       {
-#ifdef LEGION_GC
-        region_node->add_base_resource_ref(PHYSICAL_MANAGER_REF);
-#else
-        region_node->add_reference();
-#endif
+        region_node->add_base_gc_ref(PHYSICAL_MANAGER_REF);
         region_node->register_physical_manager(this);
       }
       if (instance_domain != NULL)
@@ -515,11 +511,7 @@ namespace Legion {
       if (region_node != NULL)
       {
         region_node->unregister_physical_manager(this);
-#ifdef LEGION_GC
-        if (region_node->remove_base_resource_ref(PHYSICAL_MANAGER_REF))
-#else
-        if (region_node->remove_reference())
-#endif
+        if (region_node->remove_base_gc_ref(PHYSICAL_MANAGER_REF))
           delete region_node;
       }
       if ((instance_domain != NULL) && 
@@ -542,7 +534,7 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
-      assert(Runtime::legion_spy_enabled);
+      assert(runtime->legion_spy_enabled);
 #endif
       const ApEvent inst_event = get_use_event();
       LegionSpy::log_physical_instance_creator(inst_event, creator_id, proc.id);
@@ -594,26 +586,7 @@ namespace Legion {
             constraints->offset_constraints.end(); it++)
         LegionSpy::log_instance_offset_constraint(inst_event,
                                           it->fid, it->offset);
-    }
-
-    //--------------------------------------------------------------------------
-    void PhysicalManager::force_deletion(void)
-    //--------------------------------------------------------------------------
-    {
-#ifdef DEBUG_LEGION
-      assert(is_owner());
-#endif
-      log_garbage.spew("Force deleting physical instance " IDFMT " in memory "
-                       IDFMT "", instance.id, memory_manager->memory.id);
-#ifndef DISABLE_GC
-      std::vector<PhysicalInstance::DestroyedField> serdez_fields;
-      layout->compute_destroyed_fields(serdez_fields); 
-      if (!serdez_fields.empty())
-        instance.destroy(serdez_fields);
-      else
-        instance.destroy();
-#endif
-    }
+    } 
 
     //--------------------------------------------------------------------------
     void PhysicalManager::notify_active(ReferenceMutator *mutator)
@@ -903,6 +876,36 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    bool PhysicalManager::acquire_instance(ReferenceSource source,
+                                           ReferenceMutator *mutator)
+    //--------------------------------------------------------------------------
+    {
+      // Do an atomic operation to check to see if we are already valid
+      // and increment our count if we are, in this case the acquire 
+      // has succeeded and we are done, this should be the common case
+      // since we are likely already holding valid references elsewhere
+      // Note that we cannot do this for external instances as they might
+      // have been detached while still holding valid references so they
+      // have to go through the full path every time
+      if (!is_external_instance() && check_valid_and_increment(source))
+        return true;
+      // If we're not the owner, we're not going to succeed past this
+      // since we aren't on the same node as where the instance lives
+      // which is where the point of serialization is for garbage collection
+      if (!is_owner())
+        return false;
+      // Tell our manager, we're attempting an acquire, if it tells
+      // us false then we are not allowed to proceed
+      if (!memory_manager->attempt_acquire(this))
+        return false;
+      // At this point we're in the clear to add our valid reference
+      add_base_valid_ref(source, mutator);
+      // Complete the handshake with the memory manager
+      memory_manager->complete_acquire(this);
+      return true;
+    }
+
+    //--------------------------------------------------------------------------
     void PhysicalManager::perform_deletion(RtEvent deferred_event)
     //--------------------------------------------------------------------------
     {
@@ -941,12 +944,41 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    void PhysicalManager::force_deletion(void)
+    //--------------------------------------------------------------------------
+    {
+#ifdef DEBUG_LEGION
+      assert(is_owner());
+#endif
+      log_garbage.spew("Force deleting physical instance " IDFMT " in memory "
+                       IDFMT "", instance.id, memory_manager->memory.id);
+#ifndef DISABLE_GC
+      std::vector<PhysicalInstance::DestroyedField> serdez_fields;
+      layout->compute_destroyed_fields(serdez_fields); 
+      if (!serdez_fields.empty())
+        instance.destroy(serdez_fields);
+      else
+        instance.destroy();
+#endif
+    }
+
+    //--------------------------------------------------------------------------
     void PhysicalManager::set_garbage_collection_priority(MapperID mapper_id,
                                             Processor proc, GCPriority priority)
     //--------------------------------------------------------------------------
     {
       memory_manager->set_garbage_collection_priority(this, mapper_id,
                                                       proc, priority);
+    }
+
+    //--------------------------------------------------------------------------
+    RtEvent PhysicalManager::detach_external_instance(void)
+    //--------------------------------------------------------------------------
+    {
+#ifdef DEBUG_LEGION
+      assert(is_external_instance());
+#endif
+      return memory_manager->detach_external_instance(this);
     }
 
     /////////////////////////////////////////////////////////////
@@ -980,7 +1012,7 @@ namespace Legion {
       log_garbage.info("GC Instance Manager %lld %d " IDFMT " " IDFMT " ",
        LEGION_DISTRIBUTED_ID_FILTER(did), local_space, inst.id, mem->memory.id);
 #endif
-      if (Runtime::legion_spy_enabled)
+      if (runtime->legion_spy_enabled)
       {
 #ifdef DEBUG_LEGION
         assert(use_event.exists());
@@ -1259,7 +1291,7 @@ namespace Legion {
         op(o), redop(red), use_event(u_event)
     //--------------------------------------------------------------------------
     {  
-      if (Runtime::legion_spy_enabled)
+      if (runtime->legion_spy_enabled)
       {
 #ifdef DEBUG_LEGION
         assert(use_event.exists());
@@ -1427,7 +1459,7 @@ namespace Legion {
       if (copy_domain_pre.exists() && !copy_domain_pre.has_triggered())
       {
         RtEvent wait_on = Runtime::protect_event(copy_domain_pre);
-        wait_on.lg_wait();
+        wait_on.wait();
       }
       Domain result = Domain::NO_DOMAIN;
       AutoLock m_lock(manager_lock);
@@ -1901,38 +1933,6 @@ namespace Legion {
       return NULL;
     }
 
-    //--------------------------------------------------------------------------
-    /*static*/ void VirtualManager::initialize_virtual_instance(Runtime *rt,
-                                                              DistributedID did)
-    //--------------------------------------------------------------------------
-    {
-      VirtualManager *&singleton = get_singleton();
-      // make a layout constraints
-      LayoutConstraintSet constraint_set;
-      constraint_set.add_constraint(
-          SpecializedConstraint(VIRTUAL_SPECIALIZE));
-      LayoutConstraints *constraints = 
-        rt->register_layout(FieldSpace::NO_SPACE, constraint_set);
-      FieldMask all_ones(LEGION_FIELD_MASK_FIELD_ALL_ONES);
-      std::vector<unsigned> mask_index_map;
-      std::vector<CustomSerdezID> serdez;
-      std::vector<std::pair<FieldID,size_t> > field_sizes;
-      LayoutDescription *layout = new LayoutDescription(all_ones, constraints);
-      PointerConstraint pointer_constraint(Memory::NO_MEMORY, 0);
-      singleton = new VirtualManager(rt->forest, layout,pointer_constraint,did);
-      // put a permenant resource reference on this so it is never deleted
-      singleton->add_base_resource_ref(NEVER_GC_REF);
-    }
-
-    //--------------------------------------------------------------------------
-    /*static*/ void VirtualManager::finalize_virtual_instance(void)
-    //--------------------------------------------------------------------------
-    {
-      VirtualManager *&singleton = get_singleton();
-      if (singleton->remove_base_resource_ref(NEVER_GC_REF))
-        delete singleton;
-    }
-
     /////////////////////////////////////////////////////////////
     // Instance Builder
     /////////////////////////////////////////////////////////////
@@ -1941,9 +1941,6 @@ namespace Legion {
     InstanceBuilder::~InstanceBuilder(void)
     //--------------------------------------------------------------------------
     {
-      // This only happens if we failed to make the instance
-      if (own_realm_layout && (realm_layout != NULL))
-        delete realm_layout;
     }
 
     //--------------------------------------------------------------------------
@@ -1965,6 +1962,7 @@ namespace Legion {
     {
       if (!valid)
         initialize(forest);
+      // If there are no fields then we are done
       if (field_sizes.empty())
       {
         REPORT_LEGION_WARNING(LEGION_WARNING_IGNORE_MEMORY_REQUEST,
@@ -1973,7 +1971,11 @@ namespace Legion {
                         memory_manager->memory.id);
         return NULL;
       }
-      // If there are no fields then we are done
+      // Construct the realm layout each time since (realm will take ownership 
+      // after every instance call, so we need a new one each time)
+      Realm::InstanceLayoutGeneric *realm_layout = 
+        instance_domain->create_layout(realm_constraints, 
+                                       constraints.ordering_constraint);
 #ifdef DEBUG_LEGION
       assert(realm_layout != NULL);
 #endif
@@ -2009,13 +2011,13 @@ namespace Legion {
                   memory_manager->memory, realm_layout, requests));
       // Wait for the profiling response
       if (!profiling_ready.has_triggered())
-        profiling_ready.lg_wait();
+        profiling_ready.wait();
       // If we couldn't make it then we are done
       if (!instance.exists())
         return NULL;
       // For Legion Spy we need a unique ready event if it doesn't already
       // exist so we can uniquely identify the instance
-      if (!ready.exists() && Runtime::legion_spy_enabled)
+      if (!ready.exists() && runtime->legion_spy_enabled)
       {
         ApUserEvent rename_ready = Runtime::create_ap_user_event();
         Runtime::trigger_event(rename_ready);
@@ -2023,7 +2025,6 @@ namespace Legion {
       }
       // If we successfully made the instance then Realm 
       // took over ownership of the layout
-      own_realm_layout = false;
       PhysicalManager *result = NULL;
       DistributedID did = forest->runtime->get_available_distributed_id();
       AddressSpaceID local_space = forest->runtime->address_space;
@@ -2168,7 +2169,11 @@ namespace Legion {
 #endif
       // If we failed then clear the instance name since it is not valid
       if (!result.success)
+      {
+        // Destroy the instance first so that Realm can reclaim the ID
+        instance.destroy();
         instance = PhysicalInstance::NO_INST;
+      }
       // No matter what trigger the event
       Runtime::trigger_event(profiling_ready);
     }
@@ -2471,14 +2476,8 @@ namespace Legion {
           assert(false); // unknown kind
       }
       // Compute the field groups for realm 
-      Realm::InstanceLayoutConstraints realm_constraints;
       convert_layout_constraints(constraints, field_set, 
                                  field_sizes, realm_constraints); 
-      // Create the layout
-#ifdef DEBUG_LEGION
-      assert(realm_layout == NULL);
-#endif
-      realm_layout = instance_domain->create_layout(realm_constraints, ord);
     }
 
     //--------------------------------------------------------------------------
