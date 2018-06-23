@@ -115,7 +115,7 @@ namespace Legion {
     class MapperEvent {
     public:
       MapperEvent(void)
-        : impl(RtUserEvent::NO_RT_USER_EVENT) { }
+        : impl(Internal::RtUserEvent::NO_RT_USER_EVENT) { }
       FRIEND_ALL_RUNTIME_CLASSES
     public:
       inline bool exists(void) const { return impl.exists(); }
@@ -124,7 +124,7 @@ namespace Legion {
       inline bool operator<(const MapperEvent &rhs) const
         { return (impl.id < rhs.impl.id); }
     private:
-      RtUserEvent impl;
+      Internal::RtUserEvent impl;
     };
 
     namespace ProfilingMeasurements {
@@ -198,6 +198,24 @@ namespace Legion {
 
       const Realm::ProfilingResponse *realm_resp;
       ProfilingMeasurements::RuntimeOverhead *overhead;
+    };
+
+    /**
+     * \struct TaskGeneratorArguments
+     * This structure defines the arguments that will be passed to a 
+     * task generator variant from a call to find_or_create_variant
+     * if the no variant could be found. The task generator function 
+     * will then be expected to generate one or more variants and 
+     * register them with the runtime. The first variant registered
+     * will be the one that the runtime will use to satisfy the
+     * mapper request.
+     */
+    struct TaskGeneratorArguments {
+    public:
+      TaskID                            task_id;
+      MapperID                          mapper_id;
+      ExecutionConstraintSet            execution_constraints;
+      TaskLayoutConstraintSet           layout_constraints;
     };
 
     /**
@@ -1614,6 +1632,18 @@ namespace Legion {
       void disable_reentrant(MapperContext ctx) const;
     public:
       //------------------------------------------------------------------------
+      // Methods for updating mappable data 
+      // The mapper is responsible for atomicity of these calls 
+      // (usually through the choice of mapper synchronization model) 
+      //------------------------------------------------------------------------
+      void update_mappable_tag(MapperContext ctx, const Mappable &mappable, 
+                               MappingTagID new_tag) const;
+      // Runtime will make a copy of the data passed into this method
+      void update_mappable_data(MapperContext ctx, const Mappable &mappable,
+                                const void *mapper_data, 
+                                size_t mapper_data_size) const;
+    public:
+      //------------------------------------------------------------------------
       // Methods for communicating with other mappers of the same kind
       //------------------------------------------------------------------------
       void send_message(MapperContext ctx, Processor target,const void *message,
@@ -1676,8 +1706,16 @@ namespace Legion {
       // Methods for manipulating variants 
       //------------------------------------------------------------------------
       void find_valid_variants(MapperContext ctx, TaskID task_id, 
-                                         std::vector<VariantID> &valid_variants,
+                               std::vector<VariantID> &valid_variants,
                                Processor::Kind kind = Processor::NO_KIND) const;
+      void find_generator_variants(MapperContext ctx, TaskID task_id,
+                  std::vector<std::pair<TaskID,VariantID> > &generator_variants,
+                  Processor::Kind kind = Processor::NO_KIND) const;
+      VariantID find_or_create_variant(MapperContext ctx, TaskID task_id,
+                             const ExecutionConstraintSet &execution_constrains,
+                             const TaskLayoutConstraintSet &layout_constraints,
+                             TaskID generator_tid, VariantID generator_vid, 
+                             Processor generator_processor, bool &created) const;
       bool is_leaf_variant(MapperContext ctx, TaskID task_id,
                                      VariantID variant_id) const;
       bool is_inner_variant(MapperContext ctx, TaskID task_id,
