@@ -6820,21 +6820,21 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    inline void CopyLauncher::add_gather_field(const RegionRequirement &req,
-                                               FieldID gather_field, bool inst)
+    inline void CopyLauncher::add_src_indirect_field(
+                 const RegionRequirement &req, FieldID src_idx_field, bool inst)
     //--------------------------------------------------------------------------
     {
-      gather_requirements.push_back(req);
-      gather_requirements.back().add_field(gather_field, inst);
+      src_indirect_requirements.push_back(req);
+      src_indirect_requirements.back().add_field(src_idx_field, inst);
     }
 
     //--------------------------------------------------------------------------
-    inline void CopyLauncher::add_scatter_field(const RegionRequirement &req,
-                                                FieldID scatter_field,bool inst)
+    inline void CopyLauncher::add_dst_indirect_field(
+                 const RegionRequirement &req, FieldID dst_idx_field, bool inst)
     //--------------------------------------------------------------------------
     {
-      scatter_requirements.push_back(req);
-      scatter_requirements.back().add_field(scatter_field, inst);
+      dst_indirect_requirements.push_back(req);
+      dst_indirect_requirements.back().add_field(dst_idx_field, inst);
     }
 
     //--------------------------------------------------------------------------
@@ -6912,21 +6912,21 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    inline void IndexCopyLauncher::add_gather_field(const RegionRequirement &r,
-                                               FieldID gather_field, bool inst)
+    inline void IndexCopyLauncher::add_src_indirect_field(
+                   const RegionRequirement &r, FieldID src_idx_field, bool inst)
     //--------------------------------------------------------------------------
     {
-      gather_requirements.push_back(r);
-      gather_requirements.back().add_field(gather_field, inst);
+      src_indirect_requirements.push_back(r);
+      src_indirect_requirements.back().add_field(src_idx_field, inst);
     }
 
     //--------------------------------------------------------------------------
-    inline void IndexCopyLauncher::add_scatter_field(const RegionRequirement &r,
-                                                FieldID scatter_field,bool inst)
+    inline void IndexCopyLauncher::add_dst_indirect_field(
+                    const RegionRequirement &r, FieldID dst_idx_field,bool inst)
     //--------------------------------------------------------------------------
     {
-      scatter_requirements.push_back(r);
-      scatter_requirements.back().add_field(scatter_field, inst);
+      dst_indirect_requirements.push_back(r);
+      dst_indirect_requirements.back().add_field(dst_idx_field, inst);
     }
 
     //--------------------------------------------------------------------------
@@ -7209,8 +7209,8 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     inline void AttachLauncher::attach_array_aos(void *base, bool column_major,
-                                            const std::vector<FieldID> &fields,
-                                            Memory mem, size_t alignment)
+                          const std::vector<FieldID> &fields, Memory mem,
+                          const std::map<FieldID,size_t> *alignments /*= NULL*/)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -7237,16 +7237,18 @@ namespace Legion {
       }
       constraints.add_constraint(
           OrderingConstraint(dim_order, false/*contiguous*/));
-      for (std::vector<FieldID>::const_iterator it = fields.begin();
-            it != fields.end(); it++)
-        constraints.add_constraint(AlignmentConstraint(*it, GE_EK, alignment));
+      if (alignments != NULL)
+        for (std::map<FieldID,size_t>::const_iterator it = alignments->begin();
+             it != alignments->end(); it++)
+          constraints.add_constraint(
+              AlignmentConstraint(it->first, GE_EK, it->second));
       privilege_fields.insert(fields.begin(), fields.end());
     }
     
     //--------------------------------------------------------------------------
     inline void AttachLauncher::attach_array_soa(void *base, bool column_major,
-                                            const std::vector<FieldID> &fields,
-                                            Memory mem, size_t alignment)
+                          const std::vector<FieldID> &fields, Memory mem,
+                          const std::map<FieldID,size_t> *alignments /*= NULL*/)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -7273,9 +7275,11 @@ namespace Legion {
       dim_order[3] = DIM_F;
       constraints.add_constraint(
           OrderingConstraint(dim_order, false/*contiguous*/));
-      for (std::vector<FieldID>::const_iterator it = fields.begin();
-            it != fields.end(); it++)
-        constraints.add_constraint(AlignmentConstraint(*it, GE_EK, alignment));
+      if (alignments != NULL)
+        for (std::map<FieldID,size_t>::const_iterator it = alignments->begin();
+             it != alignments->end(); it++)
+          constraints.add_constraint(
+              AlignmentConstraint(it->first, GE_EK, it->second));
       privilege_fields.insert(fields.begin(), fields.end());
     }
 

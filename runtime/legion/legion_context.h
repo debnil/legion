@@ -259,7 +259,7 @@ namespace Legion {
       virtual Future execute_index_space(const IndexTaskLauncher &launcher,
                                          ReductionOpID redop) = 0; 
       virtual PhysicalRegion map_region(const InlineLauncher &launcher) = 0;
-      virtual void remap_region(PhysicalRegion region) = 0;
+      virtual ApEvent remap_region(PhysicalRegion region) = 0;
       virtual void unmap_region(PhysicalRegion region) = 0;
       virtual void fill_fields(const FillLauncher &launcher) = 0;
       virtual void fill_fields(const IndexFillLauncher &launcher) = 0;
@@ -290,16 +290,20 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                const std::vector<StaticDependence> *dependences) = 0;
       virtual unsigned register_new_close_operation(CloseOp *op) = 0;
+      virtual unsigned register_new_summary_operation(TraceSummaryOp *op) = 0;
       virtual void add_to_prepipeline_queue(Operation *op) = 0;
       virtual void add_to_dependence_queue(Operation *op) = 0;
       virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
           const void *result, size_t size, PhysicalInstance instance) = 0;
+      virtual void register_executing_child(Operation *op) = 0;
       virtual void register_child_executed(Operation *op) = 0;
       virtual void register_child_complete(Operation *op) = 0;
       virtual void register_child_commit(Operation *op) = 0; 
       virtual void unregister_child_operation(Operation *op) = 0;
       virtual ApEvent register_fence_dependence(Operation *op) = 0;
     public:
+      virtual RtEvent get_current_mapping_fence_event(void) = 0;
+      virtual ApEvent get_current_execution_fence_event(void) = 0;
       // Break this into two pieces since we know that there are some
       // kinds of operations (like deletions) that want to act like 
       // one-sided fences (e.g. waiting on everything before) but not
@@ -309,11 +313,15 @@ namespace Legion {
       virtual void update_current_fence(FenceOp *op, 
                                         bool mapping, bool execution) = 0;
     public:
-      virtual void begin_trace(TraceID tid) = 0;
+      virtual void begin_trace(TraceID tid, bool logical_only) = 0;
       virtual void end_trace(TraceID tid) = 0;
       virtual void begin_static_trace(
                                      const std::set<RegionTreeID> *managed) = 0;
       virtual void end_static_trace(void) = 0;
+      virtual void record_previous_trace(LegionTrace *trace) = 0;
+      virtual void invalidate_trace_cache(LegionTrace *trace,
+                                          Operation *invalidator) = 0;
+      virtual void record_blocking_call(void) = 0;
     public:
       virtual void issue_frame(FrameOp *frame, ApEvent frame_termination) = 0;
       virtual void perform_frame_issue(FrameOp *frame, 
@@ -885,7 +893,7 @@ namespace Legion {
       virtual Future execute_index_space(const IndexTaskLauncher &launcher,
                                          ReductionOpID redop);
       virtual PhysicalRegion map_region(const InlineLauncher &launcher);
-      virtual void remap_region(PhysicalRegion region);
+      virtual ApEvent remap_region(PhysicalRegion region);
       virtual void unmap_region(PhysicalRegion region);
       virtual void fill_fields(const FillLauncher &launcher);
       virtual void fill_fields(const IndexFillLauncher &launcher);
@@ -913,6 +921,7 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                 const std::vector<StaticDependence> *dependences);
       virtual unsigned register_new_close_operation(CloseOp *op);
+      virtual unsigned register_new_summary_operation(TraceSummaryOp *op);
       virtual void add_to_prepipeline_queue(Operation *op);
       void process_prepipeline_stage(void);
       virtual void add_to_dependence_queue(Operation *op);
@@ -920,21 +929,28 @@ namespace Legion {
       virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
           const void *result, size_t size, PhysicalInstance instance);
       void process_post_end_tasks(void);
+      virtual void register_executing_child(Operation *op);
       virtual void register_child_executed(Operation *op);
       virtual void register_child_complete(Operation *op);
       virtual void register_child_commit(Operation *op); 
       virtual void unregister_child_operation(Operation *op);
       virtual ApEvent register_fence_dependence(Operation *op);
     public:
+      virtual RtEvent get_current_mapping_fence_event(void);
+      virtual ApEvent get_current_execution_fence_event(void);
       virtual ApEvent perform_fence_analysis(Operation *op,
-                                          bool mapping, bool execution);
+                                             bool mapping, bool execution);
       virtual void update_current_fence(FenceOp *op,
                                         bool mapping, bool execution);
     public:
-      virtual void begin_trace(TraceID tid);
+      virtual void begin_trace(TraceID tid, bool logical_only);
       virtual void end_trace(TraceID tid);
       virtual void begin_static_trace(const std::set<RegionTreeID> *managed);
       virtual void end_static_trace(void);
+      virtual void record_previous_trace(LegionTrace *trace);
+      virtual void invalidate_trace_cache(LegionTrace *trace,
+                                          Operation *invalidator);
+      virtual void record_blocking_call(void);
     public:
       virtual void issue_frame(FrameOp *frame, ApEvent frame_termination);
       virtual void perform_frame_issue(FrameOp *frame, 
@@ -1046,6 +1062,7 @@ namespace Legion {
       // Track whether this task has finished executing
       unsigned total_children_count; // total number of sub-operations
       unsigned total_close_count; 
+      unsigned total_summary_count;
       unsigned outstanding_children_count;
       LegionMap<Operation*,GenerationID,
                 EXECUTING_CHILD_ALLOC>::tracked executing_children;
@@ -1082,6 +1099,7 @@ namespace Legion {
       // Traces for this task's execution
       LegionMap<TraceID,DynamicTrace*,TASK_TRACES_ALLOC>::tracked traces;
       LegionTrace *current_trace;
+      LegionTrace *previous_trace;
       bool valid_wait_event;
       RtUserEvent window_wait;
       std::deque<ApEvent> frame_events;
@@ -1195,6 +1213,7 @@ namespace Legion {
       virtual void set_context_index(unsigned index);
       virtual int get_depth(void) const;
       virtual const char* get_task_name(void) const;
+      virtual bool has_trace(void) const;
     public:
       RemoteContext *const owner;
       unsigned context_index;
@@ -1490,7 +1509,7 @@ namespace Legion {
       virtual Future execute_index_space(const IndexTaskLauncher &launcher,
                                          ReductionOpID redop);
       virtual PhysicalRegion map_region(const InlineLauncher &launcher);
-      virtual void remap_region(PhysicalRegion region);
+      virtual ApEvent remap_region(PhysicalRegion region);
       virtual void unmap_region(PhysicalRegion region);
       virtual void fill_fields(const FillLauncher &launcher);
       virtual void fill_fields(const IndexFillLauncher &launcher);
@@ -1518,25 +1537,33 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                 const std::vector<StaticDependence> *dependences);
       virtual unsigned register_new_close_operation(CloseOp *op);
+      virtual unsigned register_new_summary_operation(TraceSummaryOp *op);
       virtual void add_to_prepipeline_queue(Operation *op);
       virtual void add_to_dependence_queue(Operation *op);
       virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
           const void *result, size_t size, PhysicalInstance instance);
+      virtual void register_executing_child(Operation *op);
       virtual void register_child_executed(Operation *op);
       virtual void register_child_complete(Operation *op);
       virtual void register_child_commit(Operation *op); 
       virtual void unregister_child_operation(Operation *op);
       virtual ApEvent register_fence_dependence(Operation *op);
     public:
+      virtual RtEvent get_current_mapping_fence_event(void);
+      virtual ApEvent get_current_execution_fence_event(void);
       virtual ApEvent perform_fence_analysis(Operation *op,
                                              bool mapping, bool execution);
       virtual void update_current_fence(FenceOp *op,
                                         bool mapping, bool execution);
     public:
-      virtual void begin_trace(TraceID tid);
+      virtual void begin_trace(TraceID tid, bool logical_only);
       virtual void end_trace(TraceID tid);
       virtual void begin_static_trace(const std::set<RegionTreeID> *managed);
       virtual void end_static_trace(void);
+      virtual void record_previous_trace(LegionTrace *trace);
+      virtual void invalidate_trace_cache(LegionTrace *trace,
+                                          Operation *invalidator);
+      virtual void record_blocking_call(void);
     public:
       virtual void issue_frame(FrameOp *frame, ApEvent frame_termination);
       virtual void perform_frame_issue(FrameOp *frame, 
@@ -1800,7 +1827,7 @@ namespace Legion {
       virtual Future execute_index_space(const IndexTaskLauncher &launcher,
                                          ReductionOpID redop);
       virtual PhysicalRegion map_region(const InlineLauncher &launcher);
-      virtual void remap_region(PhysicalRegion region);
+      virtual ApEvent remap_region(PhysicalRegion region);
       virtual void unmap_region(PhysicalRegion region);
       virtual void fill_fields(const FillLauncher &launcher);
       virtual void fill_fields(const IndexFillLauncher &launcher);
@@ -1828,25 +1855,33 @@ namespace Legion {
       virtual unsigned register_new_child_operation(Operation *op,
                 const std::vector<StaticDependence> *dependences);
       virtual unsigned register_new_close_operation(CloseOp *op);
+      virtual unsigned register_new_summary_operation(TraceSummaryOp *op);
       virtual void add_to_prepipeline_queue(Operation *op);
       virtual void add_to_dependence_queue(Operation *op);
       virtual void add_to_post_task_queue(TaskContext *ctx, RtEvent wait_on,
           const void *result, size_t size, PhysicalInstance instance);
+      virtual void register_executing_child(Operation *op);
       virtual void register_child_executed(Operation *op);
       virtual void register_child_complete(Operation *op);
       virtual void register_child_commit(Operation *op); 
       virtual void unregister_child_operation(Operation *op);
       virtual ApEvent register_fence_dependence(Operation *op);
     public:
+      virtual RtEvent get_current_mapping_fence_event(void);
+      virtual ApEvent get_current_execution_fence_event(void);
       virtual ApEvent perform_fence_analysis(Operation *op,
                                              bool mapping, bool execution);
       virtual void update_current_fence(FenceOp *op,
                                         bool mapping, bool execution);
     public:
-      virtual void begin_trace(TraceID tid);
+      virtual void begin_trace(TraceID tid, bool logical_only);
       virtual void end_trace(TraceID tid);
       virtual void begin_static_trace(const std::set<RegionTreeID> *managed);
       virtual void end_static_trace(void);
+      virtual void record_previous_trace(LegionTrace *trace);
+      virtual void invalidate_trace_cache(LegionTrace *trace,
+                                          Operation *invalidator);
+      virtual void record_blocking_call(void);
     public:
       virtual void issue_frame(FrameOp *frame, ApEvent frame_termination);
       virtual void perform_frame_issue(FrameOp *frame, 

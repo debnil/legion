@@ -217,6 +217,11 @@ namespace Legion {
       void invoke_map_dataflow_graph(Mapper::MapDataflowGraphInput *input,
                                      Mapper::MapDataflowGraphOutput *output,
                                      MappingCallInfo *info = NULL);
+    public: // memoization mapper calls
+      void invoke_memoize_operation(Mappable *mappable,
+                                    Mapper::MemoizeInput *input,
+                                    Mapper::MemoizeOutput *output,
+                                    MappingCallInfo *info = NULL);
     public: // scheduling and stealing mapper calls
       void invoke_select_tasks_to_map(Mapper::SelectMappingInput *input,
                                       Mapper::SelectMappingOutput *output,
@@ -400,6 +405,8 @@ namespace Legion {
       bool is_index_partition_complete(MappingCallInfo *info,
                                        IndexPartition p);
       Color get_index_space_color(MappingCallInfo *info, IndexSpace handle);
+      DomainPoint get_index_space_color_point(MappingCallInfo *info,
+                                              IndexSpace handle);
       Color get_index_partition_color(MappingCallInfo *info, 
                                       IndexPartition handle);
       IndexSpace get_parent_index_space(MappingCallInfo *info,

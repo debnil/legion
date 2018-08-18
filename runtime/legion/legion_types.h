@@ -335,6 +335,8 @@ namespace Legion {
       LG_TIGHTEN_INDEX_SPACE_TASK_ID,
       LG_REMOTE_PHYSICAL_REQUEST_TASK_ID,
       LG_REMOTE_PHYSICAL_RESPONSE_TASK_ID,
+      LG_REPLAY_SLICE_ID,
+      LG_DELETE_TEMPLATE_ID,
       LG_MESSAGE_ID, // These two must be the last two
       LG_RETRY_SHUTDOWN_TASK_ID,
       LG_LAST_TASK_ID, // This one should always be last
@@ -420,6 +422,8 @@ namespace Legion {
         "Tighten Index Space",                                    \
         "Remote Physical Context Request",                        \
         "Remote Physical Context Response",                       \
+        "Replay Physical Trace",                                  \
+        "Delete Physical Template",                               \
         "Remote Message",                                         \
         "Retry Shutdown",                                         \
       };
@@ -467,6 +471,7 @@ namespace Legion {
       SELECT_TUNABLE_VALUE_CALL,
       MAP_MUST_EPOCH_CALL,
       MAP_DATAFLOW_GRAPH_CALL,
+      MEMOIZE_OPERATION_CALL,
       SELECT_TASKS_TO_MAP_CALL,
       SELECT_STEAL_TARGETS_CALL,
       PERMIT_STEAL_REQUEST_CALL,
@@ -519,6 +524,7 @@ namespace Legion {
       "select_tunable_value",                       \
       "map_must_epoch",                             \
       "map_dataflow_graph",                         \
+      "memoize_operation",                          \
       "select_tasks_to_map",                        \
       "select_steal_targets",                       \
       "permit_steal_request",                       \
@@ -712,7 +718,6 @@ namespace Legion {
       SEND_CONSTRAINT_REQUEST,
       SEND_CONSTRAINT_RESPONSE,
       SEND_CONSTRAINT_RELEASE,
-      SEND_CONSTRAINT_REMOVAL,
       SEND_TOP_LEVEL_TASK_REQUEST,
       SEND_TOP_LEVEL_TASK_COMPLETE,
       SEND_MPI_RANK_EXCHANGE,
@@ -852,7 +857,6 @@ namespace Legion {
         "Send Constraint Request",                                    \
         "Send Constraint Response",                                   \
         "Send Constraint Release",                                    \
-        "Send Constraint Removal",                                    \
         "Top Level Task Request",                                     \
         "Top Level Task Complete",                                    \
         "Send MPI Rank Exchange",                                     \
@@ -1020,6 +1024,9 @@ namespace Legion {
       REDUCTION_VIEW_FIND_COPY_PRECONDITIONS_CALL,
       REDUCTION_VIEW_FIND_USER_PRECONDITIONS_CALL,
       REDUCTION_VIEW_FILTER_LOCAL_USERS_CALL,
+      PHYSICAL_TRACE_EXECUTE_CALL,
+      PHYSICAL_TRACE_PRECONDITION_CHECK_CALL,
+      PHYSICAL_TRACE_OPTIMIZE_CALL,
       LAST_RUNTIME_CALL_KIND, // This one must be last
     };
 
@@ -1178,6 +1185,9 @@ namespace Legion {
       "Reduction View Find Copy Preconditions",                       \
       "Reduction View Find User Preconditions",                       \
       "Reduction View Filter Local Users",                            \
+      "Physical Trace Execute",                                       \
+      "Physical Trace Precondition Check",                            \
+      "Physical Trace Optimize",                                      \
     };
 
     enum SemanticInfoKind {
@@ -1370,6 +1380,22 @@ namespace Legion {
     class DynamicTrace;
     class TraceCaptureOp;
     class TraceCompleteOp;
+    class TraceReplayOp;
+    class TraceBeginOp;
+    class TraceSummaryOp;
+    class PhysicalTrace;
+    struct PhysicalTemplate;
+    struct Instruction;
+    struct GetTermEvent;
+    struct CreateApUserEvent;
+    struct TriggerEvent;
+    struct MergeEvent;
+    struct AssignFenceCompletion;
+    struct IssueCopy;
+    struct IssueFill;
+    struct GetOpTermEvent;
+    struct SetOpSyncEvent;
+    struct CompleteReplay;
 
     // region_tree.h
     class RegionTreeForest;
@@ -1437,7 +1463,8 @@ namespace Legion {
     struct GenericUser;
     struct LogicalUser;
     struct PhysicalUser;
-    struct TraceInfo;
+    struct LogicalTraceInfo;
+    struct PhysicalTraceInfo;
     class ClosedNode;
     class LogicalCloser;
     class TreeCloseImpl;
@@ -1500,6 +1527,7 @@ namespace Legion {
     friend class Internal::AttachOp;                        \
     friend class Internal::DetachOp;                        \
     friend class Internal::TimingOp;                        \
+    friend class Internal::TraceSummaryOp;                  \
     friend class Internal::ExternalTask;                    \
     friend class Internal::TaskOp;                          \
     friend class Internal::SingleTask;                      \

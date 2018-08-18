@@ -1094,6 +1094,33 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    void MapperManager::invoke_memoize_operation(Mappable *mappable,
+                                                 Mapper::MemoizeInput *input,
+                                                 Mapper::MemoizeOutput *output,
+                                                 MappingCallInfo *info)
+    //--------------------------------------------------------------------------
+    {
+      if (info == NULL)
+      {
+        RtEvent continuation_precondition;
+        info = begin_mapper_call(MEMOIZE_OPERATION_CALL,
+                                 NULL, continuation_precondition);
+        if (continuation_precondition.exists())
+        {
+          MapperContinuation3<Mappable,
+                              Mapper::MemoizeInput,
+                              Mapper::MemoizeOutput,
+                              &MapperManager::invoke_memoize_operation>
+                            continuation(this, mappable, input, output, info);
+          continuation.defer(runtime, continuation_precondition);
+          return;
+        }
+      }
+      mapper->memoize_operation(info, *mappable, *input, *output);
+      finish_mapper_call(info);
+    }
+
+    //--------------------------------------------------------------------------
     void MapperManager::invoke_select_tasks_to_map(
                                     Mapper::SelectMappingInput *input,
                                     Mapper::SelectMappingOutput *output,
@@ -1416,7 +1443,8 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       pause_mapper_call(ctx);
-      LayoutConstraints *cons = runtime->register_layout(handle, constraints);
+      LayoutConstraints *cons = 
+        runtime->register_layout(handle, constraints, false/*internal*/);
       resume_mapper_call(ctx);
       return cons->layout_id;
     }
@@ -2546,6 +2574,17 @@ namespace Legion {
                 NT_TemplateHelper::encode_tag<1,coord_t>());
       resume_mapper_call(ctx);
       return point[0];
+    }
+
+    //--------------------------------------------------------------------------
+    DomainPoint MapperManager::get_index_space_color_point(MappingCallInfo *ctx,
+                                                           IndexSpace handle)
+    //--------------------------------------------------------------------------
+    {
+      pause_mapper_call(ctx);
+      DomainPoint result = runtime->get_index_space_color_point(handle);
+      resume_mapper_call(ctx);
+      return result;
     }
 
     //--------------------------------------------------------------------------

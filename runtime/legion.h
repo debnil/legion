@@ -1598,11 +1598,11 @@ namespace Legion {
       inline void add_src_field(unsigned idx, FieldID fid, bool inst = true);
       inline void add_dst_field(unsigned idx, FieldID fid, bool inst = true);
     public:
-      // Specify gather/scatter region requirements (must have exactly 1 field)
-      inline void add_gather_field(const RegionRequirement &gather_req,
-                                   FieldID gather_fid, bool inst = true);
-      inline void add_scatter_field(const RegionRequirement &scatter_req,
-                                    FieldID scatter_fid, bool inst = true);
+      // Specify src/dst indirect requirements (must have exactly 1 field)
+      inline void add_src_indirect_field(const RegionRequirement &src_idx_req,
+                                         FieldID src_idx_fid, bool inst = true);
+      inline void add_dst_indirect_field(const RegionRequirement &dst_idx_req,
+                                         FieldID dst_idx_fid, bool inst = true);
     public:
       inline void add_grant(Grant g);
       inline void add_wait_barrier(PhaseBarrier bar);
@@ -1612,8 +1612,8 @@ namespace Legion {
     public:
       std::vector<RegionRequirement>  src_requirements;
       std::vector<RegionRequirement>  dst_requirements;
-      std::vector<RegionRequirement>  gather_requirements;
-      std::vector<RegionRequirement>  scatter_requirements;
+      std::vector<RegionRequirement>  src_indirect_requirements;
+      std::vector<RegionRequirement>  dst_indirect_requirements;
       std::vector<Grant>              grants;
       std::vector<PhaseBarrier>       wait_barriers;
       std::vector<PhaseBarrier>       arrive_barriers;
@@ -1652,11 +1652,11 @@ namespace Legion {
       inline void add_src_field(unsigned idx, FieldID fid, bool inst = true);
       inline void add_dst_field(unsigned idx, FieldID fid, bool inst = true);
     public:
-      // Specify gather/scatter region requirements (must have exactly 1 field)
-      inline void add_gather_field(const RegionRequirement &gather_req,
-                                   FieldID gather_fid, bool inst = true);
-      inline void add_scatter_field(const RegionRequirement &scatter_req,
-                                    FieldID scatter_fid, bool inst = true);
+      // Specify src/dst indirect requirements (must have exactly 1 field)
+      inline void add_src_indirect_field(const RegionRequirement &src_idx_req,
+                                         FieldID src_idx_fid, bool inst = true);
+      inline void add_dst_indirect_field(const RegionRequirement &dst_idx_req,
+                                         FieldID dst_idx_fid, bool inst = true);
     public:
       inline void add_grant(Grant g);
       inline void add_wait_barrier(PhaseBarrier bar);
@@ -1666,8 +1666,8 @@ namespace Legion {
     public:
       std::vector<RegionRequirement>  src_requirements;
       std::vector<RegionRequirement>  dst_requirements;
-      std::vector<RegionRequirement>  gather_requirements;
-      std::vector<RegionRequirement>  scatter_requirements;
+      std::vector<RegionRequirement>  src_indirect_requirements;
+      std::vector<RegionRequirement>  dst_indirect_requirements;
       std::vector<Grant>              grants;
       std::vector<PhaseBarrier>       wait_barriers;
       std::vector<PhaseBarrier>       arrive_barriers;
@@ -1840,11 +1840,11 @@ namespace Legion {
       // Helper methods for AOS and SOA arrays, but it is totally 
       // acceptable to fill in the layout constraint set manually
       inline void attach_array_aos(void *base, bool column_major,
-                                   const std::vector<FieldID> &fields,
-                                   Memory mem, size_t alignment = 16);
+                             const std::vector<FieldID> &fields, Memory mem,
+                             const std::map<FieldID,size_t> *alignments = NULL);
       inline void attach_array_soa(void *base, bool column_major,
-                                   const std::vector<FieldID> &fields,
-                                   Memory mem, size_t alignment = 16);
+                             const std::vector<FieldID> &fields, Memory mem,
+                             const std::map<FieldID,size_t> *alignments = NULL);
     public:
       ExternalResource                              resource;
       LogicalRegion                                 handle;
@@ -2542,6 +2542,7 @@ namespace Legion {
         CLOSE_MAPPABLE,
         FILL_MAPPABLE,
         PARTITION_MAPPABLE,
+        DYNAMIC_COLLECTIVE_MAPPABLE,
       };
       virtual MappableType get_mappable_type(void) const = 0;
       virtual const Task* as_task(void) const = 0;
@@ -2552,6 +2553,7 @@ namespace Legion {
       virtual const Close* as_close(void) const = 0;
       virtual const Fill* as_fill(void) const = 0;
       virtual const Partition* as_partition(void) const = 0;
+      virtual const DynamicCollective* as_dynamic_collective(void) const = 0;
     public:
       MapperID                                  map_id;
       MappingTagID                              tag;
@@ -2586,6 +2588,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Task argument information
       Processor::TaskFuncID task_id; 
@@ -2638,10 +2642,14 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Copy Launcher arguments
       std::vector<RegionRequirement>    src_requirements;
       std::vector<RegionRequirement>    dst_requirements;
+      std::vector<RegionRequirement>    src_indirect_requirements;
+      std::vector<RegionRequirement>    dst_indirect_requirements;
       std::vector<Grant>                grants;
       std::vector<PhaseBarrier>         wait_barriers;
       std::vector<PhaseBarrier>         arrive_barriers;
@@ -2675,6 +2683,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Inline Launcher arguments
       RegionRequirement                 requirement;
@@ -2707,6 +2717,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Acquire Launcher arguments
       LogicalRegion                     logical_region;
@@ -2740,6 +2752,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Release Launcher arguments
       LogicalRegion                     logical_region;
@@ -2777,6 +2791,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return this; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Synthesized region requirement
       RegionRequirement                 requirement;
@@ -2806,6 +2822,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return this; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Synthesized region requirement
       RegionRequirement               requirement;
@@ -2844,6 +2862,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return this; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       enum PartitionKind {
         BY_FIELD, // create partition by field
@@ -5573,7 +5593,7 @@ namespace Legion {
        * The trace ID need only be local to the enclosing context.
        * Traces are currently not permitted to be nested.
        */
-      void begin_trace(Context ctx, TraceID tid);
+      void begin_trace(Context ctx, TraceID tid, bool logical_only = false);
       /**
        * Mark the end of trace that was being performed.
        */
@@ -6236,9 +6256,11 @@ namespace Legion {
        * functor after the application has finished executing.
        * @param pid the projection ID to use for the registration
        * @param functor the object to register for handling projections
+       * @param silence_warnings disable warnings about dynamic registration
        */
       void register_projection_functor(ProjectionID pid, 
-                                       ProjectionFunctor *functor);
+                                       ProjectionFunctor *functor,
+                                       bool silence_warnings = false);
 
       /**
        * Register a projection functor before the runtime has started only.
@@ -6411,6 +6433,20 @@ namespace Legion {
        * @return only if running in background, otherwise never
        */
       static int start(int argc, char **argv, bool background = false);
+
+      /**
+       * This 'initialize' method is an optional method that provides
+       * users a way to look at the command line arguments before they
+       * actually start the Legion runtime. Users will still need to 
+       * call 'start' in order to actually start the Legion runtime but
+       * this way they can do some static initialization and use their
+       * own command line parameters to initialize the runtime prior
+       * to actually starting it. The resulting 'argc' and 'argv' should
+       * be passed into the 'start' method or undefined behavior will occur.
+       * @param argc pointer to an integer in which to store the argument count 
+       * @param argv pointer to array of strings for storing command line args
+       */
+      static void initialize(int *argc, char ***argv);
 
       /**
        * Blocking call to wait for the runtime to shutdown when

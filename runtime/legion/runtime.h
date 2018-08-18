@@ -800,16 +800,6 @@ namespace Legion {
                                     const std::vector<LogicalRegion> &regions,
                                     MappingInstance &result, bool acquire, 
                                     bool tight_region_bounds, bool remote);
-      bool find_satisfying_instance(const LayoutConstraintSet &constraints,
-                                    const std::vector<LogicalRegion> &regions,
-                                    MappingInstance &result, 
-                                    std::set<PhysicalManager*> &candidates,
-                                    bool acquire,bool tight_bounds,bool remote);
-      bool find_satisfying_instance(LayoutConstraints *constraints,
-                                    const std::vector<LogicalRegion> &regions,
-                                    MappingInstance &result, 
-                                    std::set<PhysicalManager*> &candidates,
-                                    bool acquire,bool tight_bounds,bool remote);
       bool find_valid_instance(     const LayoutConstraintSet &constraints,
                                     const std::vector<LogicalRegion> &regions,
                                     MappingInstance &result, bool acquire, 
@@ -818,29 +808,14 @@ namespace Legion {
                                     const std::vector<LogicalRegion> &regions,
                                     MappingInstance &result, bool acquire, 
                                     bool tight_region_bounds, bool remote);
-      void release_candidate_references(const std::set<PhysicalManager*> 
-                                                        &candidates) const;
       void release_candidate_references(const std::deque<PhysicalManager*>
                                                         &candidates) const;
     protected:
-      PhysicalManager* allocate_physical_instance(
-                                    const LayoutConstraintSet &constraints,
-                                    const std::vector<LogicalRegion> &regions,
-                                    UniqueID creator_id);
-      PhysicalManager* find_and_record(PhysicalManager *manager, 
-                                    const LayoutConstraintSet &constraints,
-                                    const std::vector<LogicalRegion> &regions,
-                                    std::set<PhysicalManager*> &candidates,
-                                    bool acquire, MapperID mapper_id, 
-                                    Processor proc, GCPriority priority,
-                                    bool tight_region_bounds, bool remote);
-      PhysicalManager* find_and_record(PhysicalManager *manager, 
-                                    LayoutConstraints *constraints,
-                                    const std::vector<LogicalRegion> &regions,
-                                    std::set<PhysicalManager*> &candidates,
-                                    bool acquire, MapperID mapper_id, 
-                                    Processor proc, GCPriority priority,
-                                    bool tight_region_bounds, bool remote);
+      // We serialize all allocation attempts in a memory in order to 
+      // ensure find_and_create calls will remain atomic
+      RtEvent acquire_allocation_privilege(void);
+      void release_allocation_privilege(void);
+      PhysicalManager* allocate_physical_instance(InstanceBuilder &builder);
     public:
       bool delete_by_size_and_state(const size_t needed_size, 
                                     InstanceState state, bool larger_only); 
@@ -868,6 +843,9 @@ namespace Legion {
       // It is only valid on the owner node
       LegionMap<PhysicalManager*,InstanceInfo,
                 MEMORY_INSTANCES_ALLOC>::tracked current_instances;
+      // Keep track of outstanding requuests for allocations which 
+      // will be tried in the order that they arrive
+      std::deque<RtUserEvent> pending_allocation_attempts;
     };
 
     /**
@@ -1266,43 +1244,35 @@ namespace Legion {
      * variout places so we make it a distributed collectable
      */
     class LayoutConstraints : 
-      public LayoutConstraintSet, public Collectable,
+      public LayoutConstraintSet, public DistributedCollectable,
       public LegionHeapify<LayoutConstraints> {
     public:
       static const AllocationType alloc_type = LAYOUT_CONSTRAINTS_ALLOC; 
-    protected:
-      struct RemoveFunctor {
-      public:
-        RemoveFunctor(Serializer &r, Runtime *rt)
-          : rez(r), runtime(rt) { }
-      public:
-        void apply(AddressSpaceID target);
-      private:
-        Serializer &rez;
-        Runtime *runtime;
-      };
     public:
       LayoutConstraints(LayoutConstraintID layout_id, FieldSpace handle, 
-                        Runtime *runtime, 
-                        AddressSpace owner_space, AddressSpaceID local_space);
+                        Runtime *runtime, bool inter, DistributedID did = 0);
       LayoutConstraints(LayoutConstraintID layout_id, Runtime *runtime, 
-                        const LayoutConstraintRegistrar &registrar);
+                        const LayoutConstraintRegistrar &registrar, 
+                        bool inter, DistributedID did = 0);
       LayoutConstraints(LayoutConstraintID layout_id,
                         Runtime *runtime, const LayoutConstraintSet &cons,
-                        FieldSpace handle);
+                        FieldSpace handle, bool inter);
       LayoutConstraints(const LayoutConstraints &rhs);
       virtual ~LayoutConstraints(void);
     public:
       LayoutConstraints& operator=(const LayoutConstraints &rhs);
     public:
+      virtual void notify_active(ReferenceMutator *mutator);
+      virtual void notify_inactive(ReferenceMutator *mutator);
+      virtual void notify_valid(ReferenceMutator *mutator);
+      virtual void notify_invalid(ReferenceMutator *mutator);
+    public:
       inline FieldSpace get_field_space(void) const { return handle; }
       inline const char* get_name(void) const { return constraints_name; }
-      inline bool is_owner(void) const { return (owner_space == local_space); }
     public:
       void send_constraint_response(AddressSpaceID source,
                                     RtUserEvent done_event);
       void update_constraints(Deserializer &derez);
-      void release_remote_instances(void);
     public:
       bool entails(LayoutConstraints *other_constraints, unsigned total_dims);
       bool entails(const LayoutConstraintSet &other, unsigned total_dims) const;
@@ -1324,18 +1294,17 @@ namespace Legion {
     public:
       const LayoutConstraintID layout_id;
       const FieldSpace handle;
-      const AddressSpace owner_space;
-      const AddressSpace local_space;
-      Runtime *const runtime;
+      // True if this layout constraint object was made by the runtime
+      // False if it was made by the application or the mapper
+      const bool internal;
     protected:
       char *constraints_name;
-      mutable LocalLock layout_lock;
+      // Use the base gc_lock as the layout_lock too
+      LocalLock &layout_lock;
     protected:
       std::map<LayoutConstraintID,bool> conflict_cache;
       std::map<LayoutConstraintID,bool> entailment_cache;
       std::map<LayoutConstraintID,bool> no_pointer_entailment_cache;
-    protected:
-      NodeSet remote_instances;
     };
 
     /**
@@ -1366,6 +1335,20 @@ namespace Legion {
     public:
       virtual const DomainPoint& get_domain_point(void) const = 0;
       virtual void set_projection_result(unsigned idx,LogicalRegion result) = 0;
+    };
+
+    /**
+     * \class Memoizable
+     * An abstract class for retrieving trace local ids in physical tracing.
+     */
+    class Memoizable
+    {
+    public:
+      // Return a trace local unique ID for this operation
+      typedef std::pair<unsigned, DomainPoint> TraceLocalID;
+      virtual TraceLocalID get_trace_local_id(void) const = 0;
+      virtual ApEvent compute_sync_precondition(void) const = 0;
+      virtual void complete_replay(ApEvent complete_event) = 0;
     };
 
     /**
@@ -1436,7 +1419,14 @@ namespace Legion {
             max_message_size(DEFAULT_MAX_MESSAGE_SIZE),
             gc_epoch_size(DEFAULT_GC_EPOCH_SIZE),
             max_local_fields(DEFAULT_LOCAL_FIELDS),
+            max_replay_parallelism(DEFAULT_MAX_REPLAY_PARALLELISM),
             program_order_execution(false),
+            dump_physical_traces(false),
+            no_tracing(false),
+            no_physical_tracing(false),
+            no_trace_optimization(false),
+            no_fence_elision(false),
+            replay_on_cpus(false),
             verify_disjointness(false),
             runtime_warnings(false),
             separate_runtime_instances(false),
@@ -1481,8 +1471,15 @@ namespace Legion {
         unsigned max_message_size;
         unsigned gc_epoch_size;
         unsigned max_local_fields;
+        unsigned max_replay_parallelism;
       public:
         bool program_order_execution;
+        bool dump_physical_traces;
+        bool no_tracing;
+        bool no_physical_tracing;
+        bool no_trace_optimization;
+        bool no_fence_elision;
+        bool replay_on_cpus;
         bool verify_disjointness;
         bool runtime_warnings;
         bool separate_runtime_instances;
@@ -1596,8 +1593,15 @@ namespace Legion {
       const unsigned max_message_size;
       const unsigned gc_epoch_size;
       const unsigned max_local_fields;
+      const unsigned max_replay_parallelism;
     public:
       const bool program_order_execution;
+      const bool dump_physical_traces;
+      const bool no_tracing;
+      const bool no_physical_tracing;
+      const bool no_trace_optimization;
+      const bool no_fence_elision;
+      const bool replay_on_cpus;
       const bool verify_disjointness;
       const bool runtime_warnings;
       const bool separate_runtime_instances;
@@ -1968,7 +1972,7 @@ namespace Legion {
       void issue_release(Context ctx, const ReleaseLauncher &launcher);
       void issue_mapping_fence(Context ctx);
       void issue_execution_fence(Context ctx);
-      void begin_trace(Context ctx, TraceID tid);
+      void begin_trace(Context ctx, TraceID tid, bool logical_only);
       void end_trace(Context ctx, TraceID tid);
       void begin_static_trace(Context ctx, 
                               const std::set<RegionTreeID> *managed);
@@ -2016,7 +2020,7 @@ namespace Legion {
       void register_projection_functor(ProjectionID pid, 
                                        ProjectionFunctor *func,
                                        bool need_zero_check = true,
-                                       bool was_preregistered = false);
+                                       bool silence_warnings = false);
       static void preregister_projection_functor(ProjectionID pid,
                                        ProjectionFunctor *func);
       ProjectionFunction* find_projection_function(ProjectionID pid);
@@ -2266,7 +2270,6 @@ namespace Legion {
       void send_constraint_request(AddressSpaceID target, Serializer &rez);
       void send_constraint_response(AddressSpaceID target, Serializer &rez);
       void send_constraint_release(AddressSpaceID target, Serializer &rez);
-      void send_constraint_removal(AddressSpaceID target, Serializer &rez);
       void send_mpi_rank_exchange(AddressSpaceID target, Serializer &rez);
       void send_library_mapper_request(AddressSpaceID target, Serializer &rez);
       void send_library_mapper_response(AddressSpaceID target, Serializer &rez);
@@ -2454,7 +2457,6 @@ namespace Legion {
       void handle_constraint_request(Deserializer &derez,AddressSpaceID source);
       void handle_constraint_response(Deserializer &derez,AddressSpaceID src);
       void handle_constraint_release(Deserializer &derez);
-      void handle_constraint_removal(Deserializer &derez);
       void handle_top_level_task_request(Deserializer &derez);
       void handle_top_level_task_complete(Deserializer &derez);
       void handle_mpi_rank_exchange(Deserializer &derez);
@@ -2628,6 +2630,9 @@ namespace Legion {
       ReleaseOp*            get_available_release_op(void);
       TraceCaptureOp*       get_available_capture_op(void);
       TraceCompleteOp*      get_available_trace_op(void);
+      TraceReplayOp*        get_available_replay_op(void);
+      TraceBeginOp*         get_available_begin_op(void);
+      TraceSummaryOp*       get_available_summary_op(void);
       MustEpochOp*          get_available_epoch_op(void);
       PendingPartitionOp*   get_available_pending_partition_op(void);
       DependentPartitionOp* get_available_dependent_partition_op(void);
@@ -2665,6 +2670,9 @@ namespace Legion {
       void free_release_op(ReleaseOp *op);
       void free_capture_op(TraceCaptureOp *op);
       void free_trace_op(TraceCompleteOp *op);
+      void free_replay_op(TraceReplayOp *op);
+      void free_begin_op(TraceBeginOp *op);
+      void free_summary_op(TraceSummaryOp *op);
       void free_epoch_op(MustEpochOp *op);
       void free_pending_partition_op(PendingPartitionOp *op);
       void free_dependent_partition_op(DependentPartitionOp* op);
@@ -2940,6 +2948,9 @@ namespace Legion {
       mutable LocalLock release_op_lock;
       mutable LocalLock capture_op_lock;
       mutable LocalLock trace_op_lock;
+      mutable LocalLock replay_op_lock;
+      mutable LocalLock begin_op_lock;
+      mutable LocalLock summary_op_lock;
       mutable LocalLock epoch_op_lock;
       mutable LocalLock pending_partition_op_lock;
       mutable LocalLock dependent_partition_op_lock;
@@ -2974,6 +2985,9 @@ namespace Legion {
       std::deque<ReleaseOp*>            available_release_ops;
       std::deque<TraceCaptureOp*>       available_capture_ops;
       std::deque<TraceCompleteOp*>      available_trace_ops;
+      std::deque<TraceReplayOp*>        available_replay_ops;
+      std::deque<TraceBeginOp*>         available_begin_ops;
+      std::deque<TraceSummaryOp*>       available_summary_ops;
       std::deque<MustEpochOp*>          available_epoch_ops;
       std::deque<PendingPartitionOp*>   available_pending_partition_ops;
       std::deque<DependentPartitionOp*> available_dependent_partition_ops;
@@ -3006,9 +3020,9 @@ namespace Legion {
     public:
       LayoutConstraintID register_layout(
           const LayoutConstraintRegistrar &registrar, 
-          LayoutConstraintID id);
+          LayoutConstraintID id, DistributedID did = 0);
       LayoutConstraints* register_layout(FieldSpace handle,
-                                         const LayoutConstraintSet &cons);
+               const LayoutConstraintSet &cons, bool internal);
       bool register_layout(LayoutConstraints *new_constraints);
       void release_layout(LayoutConstraintID layout_id);
       void unregister_layout(LayoutConstraintID layout_id);
@@ -3024,6 +3038,7 @@ namespace Legion {
     public:
       // Static methods for start-up and callback phases
       static int start(int argc, char **argv, bool background);
+      static RealmRuntime initialize(int *argc, char ***argv);
       static LegionConfiguration parse_arguments(int argc, char **argv);
       static void perform_slow_config_checks(const LegionConfiguration &config);
       static void configure_mpi_interoperability(bool separate_runtimes);
@@ -3080,6 +3095,7 @@ namespace Legion {
       // Static member variables
       static Processor::TaskFuncID legion_main_id;
       static std::vector<RegistrationCallbackFnptr> registration_callbacks;
+      static bool runtime_initialized;
       static bool runtime_started;
       static bool runtime_backgrounded;
       static Runtime *the_runtime;

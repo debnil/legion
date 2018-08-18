@@ -84,6 +84,8 @@ legion_python_cxx_tests = [
     ['bindings/python/legion_python', ['hello', '-ll:py', '1', '-ll:cpu', '0']],
     ['bindings/python/legion_python', ['region', '-ll:py', '1', '-ll:cpu', '0']],
     ['bindings/python/legion_python', ['index_launch', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['method', '-ll:py', '1', '-ll:cpu', '0']],
+    ['bindings/python/legion_python', ['future', '-ll:py', '1', '-ll:cpu', '0']],
 
     # Examples
     ['examples/python_interop/python_interop', ['-ll:py', '1']],
@@ -233,6 +235,7 @@ def run_test_external(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
     # Contact: Chao Chen <cchen10@stanford.edu>
     solver_dir = os.path.join(tmp_dir, 'fastSolver2')
     cmd(['git', 'clone', 'https://github.com/Charles-Chao-Chen/fastSolver2.git', solver_dir])
+    # cmd(['git', 'checkout', '4c7a59de63dd46a0abcc7f296fa3b0f511e5e6d2', ], cwd=solver_dir)
     solver = [[os.path.join(solver_dir, 'spmd_driver/solver'),
                ['-machine', '1', '-core', '8', '-mtxlvl', '6', '-ll:cpu', '8']]]
     run_cxx(solver, flags, launcher, root_dir, None, env, thread_count)
@@ -286,6 +289,23 @@ def run_test_external(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
         ('LEGION_ROOT', root_dir),
     ])
     cmd(['make', '-C', os.path.join(task_amr_dir)], env=task_amr_env)
+
+    # Barnes-Hut
+    # Contact: Haithem Turki <turki.haithem@gmail.com>
+    barnes_hut_dir = os.path.join(tmp_dir, 'barnes_hut')
+    cmd(['git', 'clone', 'https://github.com/StanfordLegion/barnes-hut.git', barnes_hut_dir])
+    regent_path = os.path.join(root_dir, 'language', 'regent.py')
+    cmd([regent_path, 'hdf5_converter.rg',
+         '-i', 'input/bodies-16384-blitz.csv',
+         '-o', 'bodies-16384-blitz.h5',
+         '-n', '16384'],
+        cwd=barnes_hut_dir,
+        env=env)
+    cmd([regent_path, 'barnes_hut.rg',
+         '-i', 'bodies-16384-blitz.h5',
+         '-n', '16384'],
+        cwd=barnes_hut_dir,
+        env=env)
 
 def run_test_private(launcher, root_dir, tmp_dir, bin_dir, env, thread_count):
     flags = ['-logfile', 'out_%.log']
