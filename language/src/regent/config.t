@@ -37,6 +37,9 @@ local default_options = {
   ["skip-empty-tasks"] = true,
   ["vectorize"] = true,
   ["vectorize-unsafe"] = false,
+  ["doctor"] = false,
+  ["doctor-compile"] = false,
+  ["doctor-run"] = false,
 
   -- Legion runtime optimization flags:
   ["legion-leaf"] = true,
@@ -64,9 +67,6 @@ local default_options = {
   ["validate"] = true,
   ["emergency-gc"] = false,
   ["jobs"] = "1",
-  ["doctor"] = False,
-  ["doctor-compile"] = False,
-  ["doctor-run"] = False,
 
   -- Need this here to make the logger happy.
   ["log"] = "",
