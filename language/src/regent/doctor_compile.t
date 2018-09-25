@@ -12,7 +12,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- Legion Doctor
+-- Legion Doctor -- Compile-Time
 
 local ast = require("regent/ast")
 local ast_util = require("regent/ast_util")

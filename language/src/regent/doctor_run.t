@@ -72,6 +72,7 @@ end
 
 local doctor_run = {}
 
+-- Check that all region sizes are less than some threshold.
 function doctor_run.stat_expr(cx, node)
   local call = node.expr
 
@@ -159,9 +160,8 @@ function doctor_run.stat_expr(cx, node)
     end,
     conditions)
 
-  -- TODO modify region warning statement
-  
-  local print_expr = ast_util.mk_expr_call(c.printf, ast_util.mk_expr_constant("Region size exceeds threshold", rawstring))
+  -- TODO modify region warning statement to make clearer
+  local print_expr = ast_util.mk_expr_call(c.printf, ast_util.mk_expr_constant("Region size exceeds threshold value.\n", rawstring))
   local maybe_call = ast.typed.stat.If {
     cond = skip_condition,
     then_block = ast.typed.Block {
@@ -192,63 +192,26 @@ function doctor_run.stat_expr(cx, node)
 end
 
 function doctor_run.stat_var(cx, node)
-  print('top of stat_var')
-  if not node.value:is(ast.typed.expr.Partition) then
+  if not (node.value:is(ast.typed.expr.Partition) or node.value:is(ast.typed.expr.PartitionEqual)) then
     return node -- Not a Partition
   end
 
-  local result_stats = terralib.newlist()
-  result_stats:insert(node)
+  local result_list = terralib.newlist()
+  result_list:insert(node)
 
   local loop_stats = terralib.newlist()
 
   local index_symbol = std.newsymbol(int32)
   
+  local node_type = std.as_read(node.value.expr_type)
+  local ispace_type = std.as_read(node.value.colors.expr_type)
+
+  -- partition[i].ispace.volume / 
   local loop_if_cond_lhs = ast.typed.expr.Binary {
     op = "/",
     span = node.span,
     annotations = ast.default_annotations(),
     expr_type = int64,
-    lhs = ast.typed.expr.FieldAccess {
-      span = node.span,
-      annotations = ast.default_annotations(),
-      expr_type = int64,
-      field_name = "volume",
-      value = ast.typed.expr.FieldAccess {
-        span = node.span,
-        annotations = ast.default_annotations(),
-        expr_type = ispace(ptr), -- TODO fill ispace(ptr),
-        field_name = "ispace",
-        value = ast.typed.expr.IndexAccess {
-          span = node.span,
-          annotations = ast.default_annotations(),
-          expr_type = region(int32),
-          value = ast.typed.expr.ID {
-            span = node.span,
-            annotations = ast.default_annotations(),
-            expr_type = std.rawref(&node.value.expr_type),
-            value = node.symbol,
-          }, 
-          index = ast.typed.expr.Cast {
-            span = node.span,
-            annotations = ast.default_annotations(),
-            expr_type = ptr,
-            fn = ast.typed.expr.Function {
-              span = node.span,
-              annotations = ast.default_annotations(),
-              expr_type = ptr, -- TODO Probably wrong, ask how to get {untyped} -> ptr
-              value = ptr,
-            },
-            arg = ast.typed.expr.ID {
-              span = node.span,
-              annotations = ast.default_annotations(),
-              expr_type = int32,
-              value = index_symbol, -- TODO should be $i, ask Wonchan if solution is right
-            }
-          }
-        },
-      }
-    },
     rhs = ast.typed.expr.FieldAccess {
       span = node.span,
       annotations = ast.default_annotations(),
@@ -257,48 +220,77 @@ function doctor_run.stat_var(cx, node)
       value = ast.typed.expr.FieldAccess {
         span = node.span,
         annotations = ast.default_annotations(),
-        expr_type = ispace(ptr), --TODO fill ispace(ptr)
+        expr_type = ispace_type, -- TODO fill ispace(ptr),
+        field_name = "ispace",
+        value = ast.typed.expr.IndexAccess {
+          span = node.span,
+          annotations = ast.default_annotations(),
+          expr_type = std.as_read(node.value.region.expr_type),
+          value = ast.typed.expr.ID {
+            span = node.span,
+            annotations = ast.default_annotations(),
+            expr_type = std.as_read(node.value.expr_type),
+            value = node.symbol,
+          }, 
+          index = ast.typed.expr.Cast {
+            span = node.span,
+            annotations = ast.default_annotations(),
+            expr_type = int1d,
+            fn = ast.typed.expr.Function {
+              span = node.span,
+              annotations = ast.default_annotations(),
+              expr_type = int1d,
+              value = int1d,
+            },
+            arg = ast.typed.expr.ID {
+              span = node.span,
+              annotations = ast.default_annotations(),
+              expr_type = int32,
+              value = index_symbol,
+            }
+          }
+        },
+      }
+    },
+    lhs = ast.typed.expr.FieldAccess {
+      span = node.span,
+      annotations = ast.default_annotations(),
+      expr_type = int64,
+      field_name = "volume",
+      value = ast.typed.expr.FieldAccess {
+        span = node.span,
+        annotations = ast.default_annotations(),
+        expr_type = ispace(ptr),
         field_name = "ispace",
         value = ast.typed.expr.ID {
           span = node.span,
           annotations = ast.default_annotations(),
-          expr_type = std.rawref(&std.as_read(node.value.region.expr_type)),
+          expr_type = std.as_read(node.value.region.expr_type),
           value = node.value.region.value,
-        }
-      }
+        },
+      },
     },
-
   }
 
   local loop_if_cond = ast.typed.expr.Binary {
     span = node.span,
     annotations = ast.default_annotations(),
     expr_type = bool,
-    op = ">",
+    op = "<",
     rhs = ast.typed.expr.Constant {
       span = node.span,
       expr_type = double,
-      value = 0.1,
+      value = 10,
       annotations = ast.default_annotations(),
     },
     lhs = loop_if_cond_lhs
   }
 
   local then_block_stats = terralib.newlist()
-  local print_expr = ast_util.mk_expr_call(c.printf, ast_util.mk_expr_constant("A partition is too large", rawstring))
+  local print_expr = ast_util.mk_expr_call(c.printf, ast_util.mk_expr_constant("A partition is too large\n", rawstring))
   then_block_stats:insert(ast_util.mk_stat_expr(print_expr))
-  
-  local loop_if = ast.typed.stat.If {
-    cond = loop_if_cond,
-    then_block = ast.typed.Block {
-      stats = then_block_stats,
-      span = node.span,
-    },
-    elseif_blocks = terralib.newlist(),
-    else_block = terralib.newlist(),
-    annotations = ast.default_annotations(),
-    span = node.span,
-  }
+
+  local loop_if = ast_util.mk_stat_if(loop_if_cond, then_block_stats)
 
   loop_stats:insert(loop_if)
 
@@ -310,28 +302,18 @@ function doctor_run.stat_var(cx, node)
     annotations = ast.default_annotations(),
   }
 
-  local region_type = std.as_read(node.value.region.expr_type)
-  local ispace_type = std.as_read(node.value.expr_type):colors()
-  local colors_type = std.as_read(node.value.coloring.expr_type)
-  
   local loop_values_last = ast.typed.expr.FieldAccess {
     span = node.span,
     annotations = ast.default_annotations(),
     expr_type = int64,
     value = ast.typed.expr.FieldAccess {
-      value = ast.typed.expr.FieldAccess {
-        value = ast.typed.expr.ID {
-          value = node.value.region.value,
-          expr_type = std.rawref(&region_type),
-          annotations = ast.default_annotations(),
-          span = node.span,
-        },
-        field_name = "colors",
-        expr_type = colors_type,
+      value = ast.typed.expr.ID {
+        value = node.symbol,
+        expr_type = node_type,
         annotations = ast.default_annotations(),
         span = node.span,
       },
-      field_name = "ispace",
+      field_name = "colors",
       expr_type = ispace_type,
       annotations = ast.default_annotations(),
       span = node.span,
@@ -356,22 +338,9 @@ function doctor_run.stat_var(cx, node)
     values = loop_values,
   }
 
-  result_stats:insert(loop_node)
+  result_list:insert(loop_node)
 
-  local block_node = ast.typed.stat.Block {
-    block = ast.typed.Block {
-      stats = result_stats,
-      span = node.span
-    },
-    annotations = ast.default_annotations(),
-    span = node.span,
-  }
-  -- print('BLOCK NODE')
-  -- block_node:printpretty()
-  -- return block_node
-  -- return node
-  -- TODO return results_stats will work after flatmap_postorder
-  return result_stats
+  return result_list
 end
 
 local function doctor_run_node(cx)
@@ -386,7 +355,6 @@ local function doctor_run_node(cx)
 end 
 
 function doctor_run.block(cx, node)
-  -- return ast.map_node_postorder(doctor_run_node(cx), node)
   return ast.flatmap_node_postorder(doctor_run_node(cx), node)
 end
 
@@ -401,7 +369,6 @@ end
 
 function doctor_run.top(cx, node)
   if node:is(ast.typed.top.Task) then
-    print(unpack(node.name))
     map_function_to_conflicting(cx, node)
     return doctor_run.top_task(cx, node)
   else
