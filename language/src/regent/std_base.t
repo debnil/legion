@@ -21,6 +21,18 @@ local base = {}
 
 base.config, base.args = config.args()
 
+
+-- Hack: Terra symbols don't support the hash() method so monkey patch
+-- it in here. This allows deterministic hashing of Terra symbols,
+-- which is currently required by OpenMP codegen.
+do
+  local terralib_symbol = getmetatable(terralib.newsymbol(int))
+  function terralib_symbol:hash()
+    local hash_value = "__terralib_symbol_#" .. tostring(self.id)
+    return hash_value
+  end
+end
+
 -- #####################################
 -- ## Legion Bindings
 -- #################
@@ -30,8 +42,14 @@ local c = terralib.includecstring([[
 #include "legion.h"
 #include "legion_terra.h"
 #include "legion_terra_partitions.h"
+#include "murmur_hash3.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 ]])
 base.c = c
 
@@ -96,6 +114,98 @@ terra base.domain_from_bounds_3d(start : c.legion_point_3d_t,
 end
 
 -- #####################################
+-- ## Codegen Helpers
+-- #################
+
+function base.type_meet(a, b)
+  local function test()
+    local terra query(x : a, y : b)
+      if true then return x end
+      if true then return y end
+    end
+    return query:gettype().returntype
+  end
+  local valid, result_type = pcall(test)
+
+  if valid then
+    return result_type
+  end
+end
+
+local gen_optimal = terralib.memoize(
+  function(op, lhs_type, rhs_type)
+    return terra(lhs : lhs_type, rhs : rhs_type)
+      if [base.quote_binary_op(op, lhs, rhs)] then
+        return lhs
+      else
+        return rhs
+      end
+    end
+  end)
+
+base.fmax = macro(
+  function(lhs, rhs)
+    local lhs_type, rhs_type = lhs:gettype(), rhs:gettype()
+    local result_type = base.type_meet(lhs_type, rhs_type)
+    assert(result_type)
+    return `([gen_optimal(">", lhs_type, rhs_type)]([lhs], [rhs]))
+  end)
+
+base.fmin = macro(
+  function(lhs, rhs)
+    local lhs_type, rhs_type = lhs:gettype(), rhs:gettype()
+    local result_type = base.type_meet(lhs_type, rhs_type)
+    assert(result_type)
+    return `([gen_optimal("<", lhs_type, rhs_type)]([lhs], [rhs]))
+  end)
+
+function base.quote_unary_op(op, rhs)
+  if op == "-" then
+    return `(-[rhs])
+  elseif op == "not" then
+    return `(not [rhs])
+  else
+    assert(false, "unknown operator " .. tostring(op))
+  end
+end
+
+function base.quote_binary_op(op, lhs, rhs)
+  if op == "*" then
+    return `([lhs] * [rhs])
+  elseif op == "/" then
+    return `([lhs] / [rhs])
+  elseif op == "%" then
+    return `([lhs] % [rhs])
+  elseif op == "+" then
+    return `([lhs] + [rhs])
+  elseif op == "-" then
+    return `([lhs] - [rhs])
+  elseif op == "<" then
+    return `([lhs] < [rhs])
+  elseif op == ">" then
+    return `([lhs] > [rhs])
+  elseif op == "<=" then
+    return `([lhs] <= [rhs])
+  elseif op == ">=" then
+    return `([lhs] >= [rhs])
+  elseif op == "==" then
+    return `([lhs] == [rhs])
+  elseif op == "~=" then
+    return `([lhs] ~= [rhs])
+  elseif op == "and" then
+    return `([lhs] and [rhs])
+  elseif op == "or" then
+    return `([lhs] or [rhs])
+  elseif op == "max" then
+    return `([base.fmax]([lhs], [rhs]))
+  elseif op == "min" then
+    return `([base.fmin]([lhs], [rhs]))
+  else
+    assert(false, "unknown operator " .. tostring(op))
+  end
+end
+
+-- #####################################
 -- ## Physical Privilege Helpers
 -- #################
 
@@ -128,6 +238,8 @@ base.reduction_types = terralib.newlist({
     double,
     int32,
     int64,
+    uint32,
+    uint64,
 })
 
 base.reduction_op_init = {}
@@ -473,6 +585,10 @@ function base.types.is_unpack_result(t)
   return terralib.types.istype(t) and rawget(t, "is_unpack_result") or false
 end
 
+function base.types.is_string(t)
+  return terralib.types.istype(t) and rawget(t, "is_string") or false
+end
+
 function base.types.type_supports_privileges(t)
   return base.types.is_region(t) or base.types.is_list_of_regions(t)
 end
@@ -613,7 +729,8 @@ function symbol:getlabel()
 end
 
 function symbol:hash()
-  return self
+  local hash_value = "__symbol_#" .. tostring(self.symbol_id)
+  return hash_value
 end
 
 function symbol:__tostring()
@@ -674,7 +791,7 @@ do
       self.cudakernels = {}
     end
     local kernel_id = global_kernel_id
-    local kernel_name = self.name:concat("_") .. "_cuda" .. tostring(kernel_id)
+    local kernel_name = self.task:get_name():concat("_") .. "_cuda" .. tostring(kernel_id)
     self.cudakernels[kernel_id] = {
       name = kernel_name,
       kernel = kernel,
@@ -728,6 +845,20 @@ function base.variant:get_ast()
   return self.ast
 end
 
+function base.variant:set_untyped_ast(ast)
+  assert(not self.untyped_ast)
+  self.untyped_ast = ast
+end
+
+function base.variant:has_untyped_ast()
+  return self.untyped_ast
+end
+
+function base.variant:get_untyped_ast()
+  assert(self.untyped_ast)
+  return self.untyped_ast
+end
+
 function base.variant:compile()
   self.task:complete()
   return self:get_definition():compile()
@@ -738,26 +869,77 @@ function base.variant:disas()
   return self:get_definition():disas()
 end
 
+function base.variant:wrapper_name()
+  -- Must be an alphanumeric symbol, because it will be communicated through a
+  -- (generated) header file.
+  return
+    '__regent_task'
+    .. '_' .. self.task:get_task_id():asvalue()
+    .. '_' .. self:get_name()
+end
+
+function base.variant:wrapper_sig()
+  return 'void ' .. self:wrapper_name() .. '( void* data'
+                                        .. ', size_t datalen'
+                                        .. ', void* userdata'
+                                        .. ', size_t userlen'
+                                        .. ', legion_proc_id_t proc_id'
+                                        .. ');'
+end
+
+local function make_task_wrapper(task_body)
+  local return_type = task_body:gettype().returntype
+  if return_type == terralib.types.unit then
+    return terra(data : &opaque, datalen : c.size_t,
+                 userdata : &opaque, userlen : c.size_t,
+                 proc_id : c.legion_proc_id_t)
+      var task : c.legion_task_t,
+          regions : &c.legion_physical_region_t,
+          num_regions : uint32,
+          ctx : c.legion_context_t,
+          runtime : c.legion_runtime_t
+      c.legion_task_preamble(data, datalen, proc_id, &task, &regions, &num_regions, &ctx, &runtime)
+      task_body(task, regions, num_regions, ctx, runtime)
+      c.legion_task_postamble(runtime, ctx, nil, 0)
+    end
+  else
+    return terra(data : &opaque, datalen : c.size_t,
+                 userdata : &opaque, userlen : c.size_t,
+                 proc_id : c.legion_proc_id_t)
+      var task : c.legion_task_t,
+          regions : &c.legion_physical_region_t,
+          num_regions : uint32,
+          ctx : c.legion_context_t,
+          runtime : c.legion_runtime_t
+      c.legion_task_preamble(data, datalen, proc_id, &task, &regions, &num_regions, &ctx, &runtime)
+      var result = task_body(task, regions, num_regions, ctx, runtime)
+      c.legion_task_postamble(runtime, ctx, result.value, result.size)
+      c.free(result.value)
+    end
+  end
+end
+
+-- Generate task wrapper on this process (it will be compiled automatically).
+function base.variant:make_wrapper()
+  local wrapper = make_task_wrapper(self:get_definition())
+  wrapper:setname(self:wrapper_name())
+  return wrapper
+end
+
 function base.variant:__tostring()
-  return tostring(self:get_name())
+  return tostring(self.task:get_name()) .. '_' .. self:get_name()
 end
 
 do
   function base.new_variant(task, name)
     assert(base.is_task(task))
-
-    if type(name) == "string" then
-      name = data.newtuple(name)
-    elseif data.is_tuple(name) then
-      assert(data.all(name:map(function(n) return type(n) == "string" end)))
-    else
-      assert(false)
-    end
+    assert(type(name) == "string" and not name:match("%W"))
 
     local variant = setmetatable({
       task = task,
       name = name,
       ast = false,
+      untyped_ast = false,
       definition = false,
       cuda = false,
       external = false,

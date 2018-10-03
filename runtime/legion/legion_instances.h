@@ -95,7 +95,7 @@ namespace Legion {
       // A mapping from FieldIDs to indexes into our field_infos
       std::map<FieldID,unsigned/*index*/> field_indexes;
     protected:
-      Reservation layout_lock; 
+      mutable LocalLock layout_lock; 
       std::map<LEGION_FIELD_MASK_FIELD_TYPE,
                LegionList<std::pair<FieldMask,FieldMask> >::aligned> comp_cache;
     }; 
@@ -124,7 +124,6 @@ namespace Legion {
     public:
       void log_instance_creation(UniqueID creator_id, Processor proc,
                      const std::vector<LogicalRegion> &regions) const;
-      void force_deletion(void);
     public:
       inline bool is_reduction_manager(void) const;
       inline bool is_instance_manager(void) const;
@@ -192,9 +191,12 @@ namespace Legion {
       }
       inline Memory get_memory(void) const { return memory_manager->memory; }
     public:
+      bool acquire_instance(ReferenceSource source, ReferenceMutator *mutator);
       void perform_deletion(RtEvent deferred_event);
+      void force_deletion(void);
       void set_garbage_collection_priority(MapperID mapper_id, Processor p,
                                            GCPriority priority); 
+      RtEvent detach_external_instance(void);
     public:
       static inline DistributedID encode_instance_did(DistributedID did,
                                                       bool external);
@@ -331,6 +333,7 @@ namespace Legion {
           const std::vector<CopySrcDstField> &dst_fields,
           RegionTreeNode *dst, ApEvent precondition, PredEvent pred_guard,
           bool reduction_fold, bool precise_domain, 
+          PhysicalTraceInfo &trace_info,
           RegionTreeNode *intersect) = 0;
       virtual Domain get_pointer_space(void) const = 0;
     public:
@@ -354,7 +357,7 @@ namespace Legion {
       const ReductionOpID redop;
       const ApEvent use_event;
     protected:
-      Reservation manager_lock;
+      mutable LocalLock manager_lock;
 #if 0
     protected:
       // Need to deduplicate reductions to target instances
@@ -401,7 +404,8 @@ namespace Legion {
           const std::vector<CopySrcDstField> &src_fields,
           const std::vector<CopySrcDstField> &dst_fields,
           RegionTreeNode *dst, ApEvent precondition, PredEvent pred_guard,
-          bool reduction_fold, bool precise_domain, RegionTreeNode *intersect);
+          bool reduction_fold, bool precise_domain,
+          PhysicalTraceInfo &trace_info, RegionTreeNode *intersect);
       virtual Domain get_pointer_space(void) const;
     protected:
       const Domain ptr_space;
@@ -445,7 +449,8 @@ namespace Legion {
           const std::vector<CopySrcDstField> &src_fields,
           const std::vector<CopySrcDstField> &dst_fields,
           RegionTreeNode *dst, ApEvent precondition, PredEvent pred_guard,
-          bool reduction_fold, bool precise_domain, RegionTreeNode *intersect);
+          bool reduction_fold, bool precise_domain,
+          PhysicalTraceInfo &trace_info, RegionTreeNode *intersect);
       virtual Domain get_pointer_space(void) const;
     public:
       const ApEvent use_event;
@@ -479,18 +484,6 @@ namespace Legion {
       virtual void send_manager(AddressSpaceID target);
       virtual InstanceView* create_instance_top_view(InnerContext *context,
                                             AddressSpaceID logical_owner);
-    public:
-      static inline VirtualManager* get_virtual_instance(void)
-        { return get_singleton(); }
-      static void initialize_virtual_instance(Runtime *runtime,
-                                              DistributedID did);
-      static void finalize_virtual_instance(void);
-    protected:
-      static inline VirtualManager*& get_singleton(void)
-      {
-        static VirtualManager *singleton = NULL;
-        return singleton;
-      }
     };
 
     /**
@@ -505,17 +498,16 @@ namespace Legion {
         : regions(regs), constraints(cons), runtime(rt), memory_manager(memory),
           creator_id(cid), instance(PhysicalInstance::NO_INST), ancestor(NULL), 
           instance_domain(NULL), own_domain(false), redop_id(0), 
-          reduction_op(NULL), realm_layout(NULL), 
-          own_realm_layout(true), valid(false) { }
+          reduction_op(NULL), valid(false) { }
       virtual ~InstanceBuilder(void);
     public:
+      void initialize(RegionTreeForest *forest);
       size_t compute_needed_size(RegionTreeForest *forest);
       PhysicalManager* create_physical_instance(RegionTreeForest *forest);
     public:
       virtual void handle_profiling_response(
                     const Realm::ProfilingResponse &response);
     protected:
-      void initialize(RegionTreeForest *forest);
       void compute_ancestor_and_domain(RegionTreeForest *forest);
       RegionNode* find_common_ancestor(RegionNode *one, RegionNode *two) const;
     protected:
@@ -546,8 +538,7 @@ namespace Legion {
       FieldMask instance_mask;
       ReductionOpID redop_id;
       const ReductionOp *reduction_op;
-      Realm::InstanceLayoutGeneric *realm_layout;
-      bool own_realm_layout;
+      Realm::InstanceLayoutConstraints realm_constraints;
     public:
       bool valid;
     };

@@ -182,9 +182,7 @@ namespace Realm {
 
     AddressSpace Processor::address_space(void) const
     {
-      // this is a hack for the Legion runtime, which only calls it on processor, not proc groups
       ID id(*this);
-      assert(id.is_processor());
       return id.proc.owner_node;
     }
 
@@ -410,6 +408,10 @@ namespace Realm {
     }
 
     ProcessorImpl::~ProcessorImpl(void)
+    {
+    }
+
+    void ProcessorImpl::start_threads(void)
     {
     }
 
@@ -837,9 +839,6 @@ namespace Realm {
       log_proc.info("no processor init task: proc=" IDFMT "", me.id);
     }
 #endif
-
-    // finally, fire up the scheduler
-    sched->start();
   }
 
   void LocalTaskProcessor::add_to_group(ProcessorGroup *group)
@@ -946,6 +945,13 @@ namespace Realm {
 		me);
   }
 
+  // starts worker threads and performs any per-processor initialization
+  void LocalTaskProcessor::start_threads(void)
+  {
+    // finally, fire up the scheduler
+    sched->start();
+  }
+
   // blocks until things are cleaned up
   void LocalTaskProcessor::shutdown(void)
   {
@@ -1014,13 +1020,21 @@ namespace Realm {
   //
 
   LocalUtilityProcessor::LocalUtilityProcessor(Processor _me, CoreReservationSet& crs,
-					       size_t _stack_size, bool _force_kthreads)
+					       size_t _stack_size, bool _force_kthreads, bool _pin_util_proc)
     : LocalTaskProcessor(_me, Processor::UTIL_PROC)
   {
     CoreReservationParameters params;
     params.set_num_cores(1);
-    params.set_alu_usage(params.CORE_USAGE_SHARED);
-    params.set_fpu_usage(params.CORE_USAGE_MINIMAL);
+    if (_pin_util_proc)
+    {
+      params.set_alu_usage(params.CORE_USAGE_EXCLUSIVE);
+      params.set_fpu_usage(params.CORE_USAGE_EXCLUSIVE);
+    }
+    else
+    {
+      params.set_alu_usage(params.CORE_USAGE_SHARED);
+      params.set_fpu_usage(params.CORE_USAGE_MINIMAL);
+    }
     params.set_ldst_usage(params.CORE_USAGE_SHARED);
     params.set_max_stack_size(_stack_size);
 

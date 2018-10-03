@@ -87,13 +87,13 @@ namespace Legion {
         if (need_tight_result)
         {
           // Wait for the index space to be tight
-          tight_index_space_set.lg_wait();
+          tight_index_space_set.wait();
           // Fall through and get the result when we're done
         }
         else
         {
           if (!realm_index_space_set.has_triggered())
-            realm_index_space_set.lg_wait();
+            realm_index_space_set.wait();
           // Not tight yet so still subject to change so we need the lock
           AutoLock n_lock(node_lock,1,false/*exclusive*/);
           result = realm_index_space;
@@ -115,15 +115,18 @@ namespace Legion {
 #ifdef DEBUG_LEGION
       assert(!realm_index_space_set.has_triggered());
 #endif
+      // We can set this now but triggering the realm_index_space_set
+      // event has to be done while holding the node_lock on the owner
+      // node so that it is serialized with respect to queries from 
+      // remote nodes for copies about the remote instance
       realm_index_space = value;
-      Runtime::trigger_event(realm_index_space_set);
-      // Now we can tighten it
-      tighten_index_space();
       // If we're not the owner, send a message back to the
       // owner specifying that it can set the index space value
       const AddressSpaceID owner_space = get_owner_space();
       if (owner_space != context->runtime->address_space)
       {
+        // We're not the owner so we can trigger the event without the lock
+        Runtime::trigger_event(realm_index_space_set);
         // We're not the owner, if this is not from the owner then
         // send a message there telling the owner that it is set
         if (source != owner_space)
@@ -132,29 +135,37 @@ namespace Legion {
           {
             RezCheck z(rez);
             rez.serialize(handle);
-            pack_index_space(rez);
+            pack_index_space(rez, false/*include size*/);
           }
           context->runtime->send_index_space_set(owner_space, rez);
         }
+        
       }
       else
       {
         // Log subspaces being set on the owner
-        if (Runtime::legion_spy_enabled && (parent != NULL))
+        if (implicit_runtime->legion_spy_enabled && (parent != NULL))
           this->log_index_space_points(realm_index_space);
-        // We're the owner, send messages to everyone else that we've 
-        // sent this node to except the source
-        Serializer rez;
-        {
-          RezCheck z(rez);
-          rez.serialize(handle);
-          pack_index_space(rez);
-        }
-        IndexSpaceSetFunctor functor(context->runtime, source, rez);
         // Hold the lock while walking over the node set
-        AutoLock n_lock(node_lock,1,false/*exclusive*/);
-        remote_instances.map(functor); 
+        AutoLock n_lock(node_lock);
+        // Now we can trigger the event while holding the lock
+        Runtime::trigger_event(realm_index_space_set);
+        if (!remote_instances.empty())
+        {
+          // We're the owner, send messages to everyone else that we've 
+          // sent this node to except the source
+          Serializer rez;
+          {
+            RezCheck z(rez);
+            rez.serialize(handle);
+            pack_index_space(rez, false/*include size*/);
+          }
+          IndexSpaceSetFunctor functor(context->runtime, source, rez);
+          remote_instances.map(functor); 
+        }
       }
+      // Now we can tighten it
+      tighten_index_space();
     }
 
     //--------------------------------------------------------------------------
@@ -172,7 +183,7 @@ namespace Legion {
         TightenIndexSpaceArgs args;
         args.proxy_this = this;
         context->runtime->issue_runtime_meta_task(args,LG_LATENCY_WORK_PRIORITY,
-                  NULL/*Operation*/, Runtime::protect_event(index_space_ready));
+                                     Runtime::protect_event(index_space_ready));
         return;
       }
       Realm::IndexSpace<DIM,T> tight_space = realm_index_space.tighten();
@@ -825,7 +836,7 @@ namespace Legion {
         Runtime::merge_events(lhs_ready, rhs_ready)));
       // Wait for the result to be ready
       if (!ready.has_triggered())
-        ready.lg_wait();
+        ready.wait();
       // Always tighten these tests so that they are precise
       Realm::IndexSpace<DIM,T> tight_intersection = intersection.tighten();
       bool result = !tight_intersection.empty();
@@ -896,7 +907,7 @@ namespace Legion {
             lhs_space, rhs_space, intersection, requests,
             Runtime::merge_events(lhs_ready, rhs_ready)));
       if (!ready.has_triggered())
-        ready.lg_wait();
+        ready.wait();
       // Always tighten these tests so that they are precise
       Realm::IndexSpace<DIM,T> tight_intersection = intersection.tighten();
       bool result = !tight_intersection.empty();
@@ -966,7 +977,7 @@ namespace Legion {
         ApEvent ready(Realm::IndexSpace<DIM,T>::compute_difference(
           rhs_space, local_space, difference, requests, rhs_ready));
         if (!ready.has_triggered())
-          ready.lg_wait();
+          ready.wait();
         // Always tighten these tests so that they are precise
         Realm::IndexSpace<DIM,T> tight_difference = difference.tighten();
         result = tight_difference.empty();
@@ -1027,7 +1038,7 @@ namespace Legion {
         ApEvent ready(Realm::IndexSpace<DIM,T>::compute_difference(
               rhs_space, local_space, difference, requests, rhs_ready));
         if (!ready.has_triggered())
-          ready.lg_wait();
+          ready.wait();
         // Always tighten these tests so that they are precise
         Realm::IndexSpace<DIM,T> tight_difference = difference.tighten();
         result = tight_difference.empty();
@@ -1046,17 +1057,17 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     template<int DIM, typename T>
-    void IndexSpaceNodeT<DIM,T>::pack_index_space(Serializer &rez) const
+    void IndexSpaceNodeT<DIM,T>::pack_index_space(Serializer &rez,
+                                                  bool include_size) const
     //--------------------------------------------------------------------------
     {
-      if (realm_index_space_set.has_triggered())
-      {
-        // No need for the lock, held by the caller
+#ifdef DEBUG_LEGION
+      assert(realm_index_space_set.has_triggered());
+#endif
+      if (include_size)
         rez.serialize<size_t>(sizeof(realm_index_space));
-        rez.serialize(realm_index_space);
-      }
-      else
-        rez.serialize<size_t>(0); // not ready yet
+      // No need for the lock, held by the caller
+      rez.serialize(realm_index_space);
     }
 
     //--------------------------------------------------------------------------
@@ -1065,12 +1076,7 @@ namespace Legion {
                                                     AddressSpaceID source)
     //--------------------------------------------------------------------------
     {
-      size_t size;
-      derez.deserialize(size);
       Realm::IndexSpace<DIM,T> result_space;
-#ifdef DEBUG_LEGION
-      assert(size == sizeof(result_space));
-#endif
       derez.deserialize(result_space);
       set_realm_index_space(source, result_space);
     }
@@ -2487,6 +2493,7 @@ namespace Legion {
                         const std::vector<CopySrcDstField> &dst_fields,
 #endif
                         ApEvent precondition, PredEvent predicate_guard,
+                        PhysicalTraceInfo &trace_info,
                         IndexTreeNode *intersect/*=NULL*/,
                         ReductionOpID redop /*=0*/,bool reduction_fold/*=true*/)
     //--------------------------------------------------------------------------
@@ -2495,9 +2502,20 @@ namespace Legion {
       Realm::ProfilingRequestSet requests;
       if (op != NULL)
         op->add_copy_profiling_request(requests); 
-      if (op->has_execution_fence_event())
+      if ((op != NULL) && op->has_execution_fence_event())
+      {
+        ApEvent old_precondition = precondition;
         precondition = Runtime::merge_events(precondition,
                         op->get_execution_fence_event());
+        if (trace_info.recording)
+        {
+#ifdef DEBUG_LEGION
+          assert(trace_info.tpl != NULL && trace_info.tpl->is_recording());
+#endif
+          trace_info.tpl->record_merge_events(precondition, old_precondition,
+              op->get_execution_fence_event(), trace_info.op);
+        }
+      }
       ApEvent result;
       if ((intersect == NULL) || (intersect == this))
       {
@@ -2505,7 +2523,13 @@ namespace Legion {
           context->runtime->profiler->add_copy_request(requests, op);
         // Include our event precondition if necessary
         if (index_space_ready.exists())
+        {
+          ApEvent old_precondition = precondition;
           precondition = Runtime::merge_events(precondition, index_space_ready);
+          if (trace_info.recording)
+            trace_info.tpl->record_merge_events(precondition, old_precondition,
+                index_space_ready, trace_info.op);
+        }
         Realm::IndexSpace<DIM,T> local_space;
         get_realm_index_space(local_space, true/*tight*/);
         // Have to protect against misspeculation
@@ -2513,6 +2537,9 @@ namespace Legion {
         {
           ApEvent pred_pre = Runtime::merge_events(precondition,
                                                    ApEvent(predicate_guard));
+          if (trace_info.recording)
+            trace_info.tpl->record_merge_events(pred_pre, precondition,
+                ApEvent(predicate_guard), trace_info.op);
           result = Runtime::ignorefaults(local_space.copy(src_fields, 
                 dst_fields, requests, pred_pre, redop, reduction_fold));
         }
@@ -2579,6 +2606,9 @@ namespace Legion {
         {
           ApEvent pred_pre = Runtime::merge_events(precondition,
                                                    ApEvent(predicate_guard));
+          if (trace_info.recording)
+            trace_info.tpl->record_merge_events(pred_pre, precondition,
+                ApEvent(predicate_guard), trace_info.op);
           result = Runtime::ignorefaults(intersection.copy(src_fields, 
                 dst_fields, requests, pred_pre, redop, reduction_fold));
         }
@@ -2607,6 +2637,7 @@ namespace Legion {
 #endif
                         const void *fill_value, size_t fill_size,
                         ApEvent precondition, PredEvent predicate_guard,
+                        PhysicalTraceInfo &trace_info,
                         IndexTreeNode *intersect)
     //--------------------------------------------------------------------------
     {
@@ -2615,8 +2646,19 @@ namespace Legion {
       if (op != NULL)
         op->add_copy_profiling_request(requests); 
       if ((op != NULL) && op->has_execution_fence_event())
+      {
+        ApEvent old_precondition = precondition;
         precondition = Runtime::merge_events(precondition,
                         op->get_execution_fence_event());
+        if (trace_info.recording)
+        {
+#ifdef DEBUG_LEGION
+          assert(trace_info.tpl != NULL && trace_info.tpl->is_recording());
+#endif
+          trace_info.tpl->record_merge_events(precondition, old_precondition,
+              op->get_execution_fence_event(), trace_info.op);
+        }
+      }
       ApEvent result;
       if ((intersect == NULL) || (intersect == this))
       {
@@ -2624,7 +2666,13 @@ namespace Legion {
           context->runtime->profiler->add_fill_request(requests, op);
         // Include our event precondition if necessary
         if (index_space_ready.exists())
+        {
+          ApEvent old_precondition = precondition;
           precondition = Runtime::merge_events(precondition, index_space_ready);
+          if (trace_info.recording)
+            trace_info.tpl->record_merge_events(precondition, old_precondition,
+                index_space_ready, trace_info.op);
+        }
         Realm::IndexSpace<DIM,T> local_space;
         get_realm_index_space(local_space, true/*tight*/);
         // Have to protect against misspeculation
@@ -2632,6 +2680,9 @@ namespace Legion {
         {
           ApEvent pred_pre = Runtime::merge_events(precondition,
                                                    ApEvent(predicate_guard));
+          if (trace_info.recording)
+            trace_info.tpl->record_merge_events(pred_pre, precondition,
+                ApEvent(predicate_guard), trace_info.op);
           result = Runtime::ignorefaults(local_space.fill(dst_fields, 
                 requests, fill_value, fill_size, pred_pre));
         }
@@ -2686,6 +2737,9 @@ namespace Legion {
         {
           ApEvent pred_pre = Runtime::merge_events(precondition,
                                                    ApEvent(predicate_guard));
+          if (trace_info.recording)
+            trace_info.tpl->record_merge_events(pred_pre, precondition,
+                ApEvent(predicate_guard), trace_info.op);
           result = Runtime::ignorefaults(intersection.fill(dst_fields, 
                 requests, fill_value, fill_size, pred_pre));
         }
@@ -2965,7 +3019,7 @@ namespace Legion {
       ApEvent diff_ready(Realm::IndexSpace<DIM,T>::compute_difference(
           parent_space, union_space, difference_space, requests, parent_ready));
       if (!diff_ready.has_triggered())
-        diff_ready.lg_wait();
+        diff_ready.wait();
       // Always tighten these tests so that they are precise
       Realm::IndexSpace<DIM,T> tight_space = difference_space.tighten();
       bool complete = tight_space.empty();
@@ -3022,7 +3076,7 @@ namespace Legion {
             lhs_space, rhs_space, intersection, requests,
             Runtime::merge_events(union_precondition, rhs_ready)));
       if (!ready.has_triggered())
-        ready.lg_wait();
+        ready.wait();
       // Always tighten these tests so that they are precise
       Realm::IndexSpace<DIM,T> tight_intersection = intersection.tighten();
       bool result = !tight_intersection.empty();
@@ -3095,7 +3149,7 @@ namespace Legion {
             lhs_space, rhs_space, intersection, requests,
             Runtime::merge_events(union_precondition, rhs_precondition)));
       if (!ready.has_triggered())
-        ready.lg_wait();
+        ready.wait();
       // Always tighten these tests so that they are precise
       Realm::IndexSpace<DIM,T> tight_intersection = intersection.tighten();
       bool result = !tight_intersection.empty();
@@ -3162,7 +3216,7 @@ namespace Legion {
         ApEvent ready(Realm::IndexSpace<DIM,T>::compute_difference(
               rhs_space, union_space, difference, requests, rhs_ready));
         if (!ready.has_triggered())
-          ready.lg_wait();
+          ready.wait();
         // Always tighten these tests so that they are precise
         Realm::IndexSpace<DIM,T> tight_difference = difference.tighten();
         result = tight_difference.empty();
@@ -3226,7 +3280,7 @@ namespace Legion {
         ApEvent ready(Realm::IndexSpace<DIM,T>::compute_difference(
               rhs_space, union_space, difference, requests, rhs_precondition));
         if (!ready.has_triggered())
-          ready.lg_wait();
+          ready.wait();
         // Always tighten these tests so that they are precise
         Realm::IndexSpace<DIM,T> tight_difference = difference.tighten();
         result = tight_difference.empty();
@@ -3319,7 +3373,7 @@ namespace Legion {
           if (delete_union_space)
           {
             if (!union_ready.has_triggered())
-              union_ready.lg_wait();
+              union_ready.wait();
             union_space.destroy(); 
           }
           if (!need_tight_result)
@@ -3336,7 +3390,7 @@ namespace Legion {
         }
         // If we make it here we need to tighten our result
         if (!partition_union_ready.has_triggered())
-          partition_union_ready.lg_wait();
+          partition_union_ready.wait();
         Realm::IndexSpace<DIM,T> tight_space = result.tighten();
         // Retake the lock and see if we were the first to tighten
         Realm::IndexSpace<DIM,T> to_destroy;

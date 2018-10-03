@@ -14,6 +14,10 @@
 
 -- Regent Language Entry Point
 
+local profile = require("regent/profile")
+
+profile.set_import_time() -- Mark this as the first time we are entering into the Regent compiler
+
 local builtins = require("regent/builtins")
 local passes = require("regent/passes")
 local passes_default = require("regent/passes_default")
@@ -64,6 +68,7 @@ local language = {
     "__leaf",
     "__mapping",
     "__openmp",
+    "__optimize",
     "__parallel",
     "__parallelize_with",
     "__physical",

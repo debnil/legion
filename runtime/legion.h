@@ -851,7 +851,7 @@ namespace Legion {
     protected:
       // Only the runtime is allowed to make non-empty phase barriers
       FRIEND_ALL_RUNTIME_CLASSES
-      PhaseBarrier(ApBarrier b);
+      PhaseBarrier(Internal::ApBarrier b);
     public:
       bool operator<(const PhaseBarrier &rhs) const;
       bool operator==(const PhaseBarrier &rhs) const;
@@ -863,7 +863,7 @@ namespace Legion {
       Realm::Barrier get_barrier(void) const { return phase_barrier; }
       bool exists(void) const;
     protected:
-      ApBarrier phase_barrier;
+      Internal::ApBarrier phase_barrier;
       friend std::ostream& operator<<(std::ostream& os, const PhaseBarrier& pb);
     };
 
@@ -887,7 +887,7 @@ namespace Legion {
     protected:
       // Only the runtime is allowed to make non-empty dynamic collectives
       FRIEND_ALL_RUNTIME_CLASSES
-      DynamicCollective(ApBarrier b, ReductionOpID redop);
+      DynamicCollective(Internal::ApBarrier b, ReductionOpID redop);
     public:
       // All the same operations as a phase barrier
       void arrive(const void *value, size_t size, unsigned count = 1);
@@ -1155,6 +1155,13 @@ namespace Legion {
        * @param silence_warnings silence any warnings for this blocking call
        */
       bool is_empty(bool block = false, bool silence_warnings = false) const;
+      /**
+       * Check to see if the future is ready. This will return
+       * true if the future can be used without blocking to wait
+       * on the computation that the future represents, otherwise
+       * it will return false.
+       */
+      bool is_ready(void) const;
     public:
       /**
        * Return a const reference to the future.
@@ -1591,11 +1598,11 @@ namespace Legion {
       inline void add_src_field(unsigned idx, FieldID fid, bool inst = true);
       inline void add_dst_field(unsigned idx, FieldID fid, bool inst = true);
     public:
-      // Specify gather/scatter region requirements (must have exactly 1 field)
-      inline void add_gather_field(const RegionRequirement &gather_req,
-                                   FieldID gather_fid, bool inst = true);
-      inline void add_scatter_field(const RegionRequirement &scatter_req,
-                                    FieldID scatter_fid, bool inst = true);
+      // Specify src/dst indirect requirements (must have exactly 1 field)
+      inline void add_src_indirect_field(const RegionRequirement &src_idx_req,
+                                         FieldID src_idx_fid, bool inst = true);
+      inline void add_dst_indirect_field(const RegionRequirement &dst_idx_req,
+                                         FieldID dst_idx_fid, bool inst = true);
     public:
       inline void add_grant(Grant g);
       inline void add_wait_barrier(PhaseBarrier bar);
@@ -1605,8 +1612,8 @@ namespace Legion {
     public:
       std::vector<RegionRequirement>  src_requirements;
       std::vector<RegionRequirement>  dst_requirements;
-      std::vector<RegionRequirement>  gather_requirements;
-      std::vector<RegionRequirement>  scatter_requirements;
+      std::vector<RegionRequirement>  src_indirect_requirements;
+      std::vector<RegionRequirement>  dst_indirect_requirements;
       std::vector<Grant>              grants;
       std::vector<PhaseBarrier>       wait_barriers;
       std::vector<PhaseBarrier>       arrive_barriers;
@@ -1645,11 +1652,11 @@ namespace Legion {
       inline void add_src_field(unsigned idx, FieldID fid, bool inst = true);
       inline void add_dst_field(unsigned idx, FieldID fid, bool inst = true);
     public:
-      // Specify gather/scatter region requirements (must have exactly 1 field)
-      inline void add_gather_field(const RegionRequirement &gather_req,
-                                   FieldID gather_fid, bool inst = true);
-      inline void add_scatter_field(const RegionRequirement &scatter_req,
-                                    FieldID scatter_fid, bool inst = true);
+      // Specify src/dst indirect requirements (must have exactly 1 field)
+      inline void add_src_indirect_field(const RegionRequirement &src_idx_req,
+                                         FieldID src_idx_fid, bool inst = true);
+      inline void add_dst_indirect_field(const RegionRequirement &dst_idx_req,
+                                         FieldID dst_idx_fid, bool inst = true);
     public:
       inline void add_grant(Grant g);
       inline void add_wait_barrier(PhaseBarrier bar);
@@ -1659,8 +1666,8 @@ namespace Legion {
     public:
       std::vector<RegionRequirement>  src_requirements;
       std::vector<RegionRequirement>  dst_requirements;
-      std::vector<RegionRequirement>  gather_requirements;
-      std::vector<RegionRequirement>  scatter_requirements;
+      std::vector<RegionRequirement>  src_indirect_requirements;
+      std::vector<RegionRequirement>  dst_indirect_requirements;
       std::vector<Grant>              grants;
       std::vector<PhaseBarrier>       wait_barriers;
       std::vector<PhaseBarrier>       arrive_barriers;
@@ -1833,11 +1840,11 @@ namespace Legion {
       // Helper methods for AOS and SOA arrays, but it is totally 
       // acceptable to fill in the layout constraint set manually
       inline void attach_array_aos(void *base, bool column_major,
-                                   const std::vector<FieldID> &fields,
-                                   Memory mem, size_t alignment = 16);
+                             const std::vector<FieldID> &fields, Memory mem,
+                             const std::map<FieldID,size_t> *alignments = NULL);
       inline void attach_array_soa(void *base, bool column_major,
-                                   const std::vector<FieldID> &fields,
-                                   Memory mem, size_t alignment = 16);
+                             const std::vector<FieldID> &fields, Memory mem,
+                             const std::map<FieldID,size_t> *alignments = NULL);
     public:
       ExternalResource                              resource;
       LogicalRegion                                 handle;
@@ -1939,17 +1946,15 @@ namespace Legion {
      * describing a task variant including the logical task ID, the execution
      * constraints, the layout constraints, and any properties of the task.
      * This structure is used for registering task variants and is also
-     * the output type for variants created by task variant generators.
+     * the output type for variants created by generator tasks.
      */
     struct TaskVariantRegistrar {
     public:
       TaskVariantRegistrar(void);
       TaskVariantRegistrar(TaskID task_id, bool global = true,
-                           GeneratorContext ctx = NULL,
                            const char *variant_name = NULL);
       TaskVariantRegistrar(TaskID task_id, const char *variant_name,
-			   bool global = true,
-                           GeneratorContext ctx = NULL);
+			   bool global = true);
     public: // Add execution constraints
       inline TaskVariantRegistrar& 
         add_constraint(const ISAConstraint &constraint);
@@ -1969,91 +1974,23 @@ namespace Legion {
       inline void set_inner(bool is_inner = true);
       inline void set_idempotent(bool is_idempotent = true);
       inline void set_replicable(bool is_replicable = true);
+    public: // Generator Task IDs
+      inline void add_generator_task(TaskID tid);
     public:
       TaskID                            task_id;
-      GeneratorContext                  generator;
       bool                              global_registration;
       const char*                       task_variant_name;
     public: // constraints
       ExecutionConstraintSet            execution_constraints; 
       TaskLayoutConstraintSet           layout_constraints;
+    public:
+      // TaskIDs for which this variant can serve as a generator
+      std::set<TaskID>                  generator_tasks;
     public: // properties
       bool                              leaf_variant;
       bool                              inner_variant;
       bool                              idempotent_variant;
       bool                              replicable_variant;
-    };
-
-    //==========================================================================
-    //                          Task Generators 
-    //==========================================================================
-
-    /**
-     * \struct TaskGeneratorArguments
-     * This structure defines the arguments that will be passed to a 
-     * task generator function. The task generator function will then
-     * be expected to generate one or more variants and register them
-     * with the runtime.
-     */
-    struct TaskGeneratorArguments {
-    public:
-      TaskID                            task_id;
-    public:
-      const void*                       user_data;
-      size_t                            user_data_size;
-    public:
-      MapperID                          mapper_id;
-      const void*                       mapper_args;
-      size_t                            mapper_args_size;
-    public:
-      std::vector<Processor>            target_procs;
-      // TODO: std::vector<PhysicalInstance> valid_instances;
-    };
-
-    /**
-     * \struct TaskGeneratorRegistrar
-     * The TaskGeneratorRegistrar records the arguments for registering
-     * a new task generator function for a specific task_id with the runtime. 
-     * The application must specify a unique generator ID to associate with 
-     * the generator function pointer for the particular task ID, but the
-     * same generator function pointer can be registered for multiple
-     * task IDs as long as the generator IDs are all different. The 
-     * application can also provide optional constraints on the kinds of
-     * task variants the generator can emit. All other arguments are optional 
-     * and can be filled in at the application's discretion.
-     */
-    struct TaskGeneratorRegistrar {
-    public:
-      TaskGeneratorRegistrar(void);
-      TaskGeneratorRegistrar(GeneratorID id, TaskID task_id, GeneratorFnptr fn,
-                             const void *udata = NULL, size_t udata_size = 0,
-                             const char *name = NULL);
-    public: // Add execution constraints
-      inline TaskGeneratorRegistrar& 
-        add_constraint(const ISAConstraint &constraint);
-      inline TaskGeneratorRegistrar&
-        add_constraint(const ProcessorConstraint &constraint);
-      inline TaskGeneratorRegistrar& 
-        add_constraint(const ResourceConstraint &constraint);
-      inline TaskGeneratorRegistrar&
-        add_constraint(const LaunchConstraint &constraint);
-      inline TaskGeneratorRegistrar&
-        add_constraint(const ColocationConstraint &constraint);
-    public: // Add layout constraint sets
-      inline TaskGeneratorRegistrar&
-        add_layout_constraint_set(unsigned index, LayoutConstraintID desc);
-    public:
-      GeneratorID                       generator_id;
-      TaskID                            task_id;
-      GeneratorFnptr                    generator;
-    public: // constraints
-      ExecutionConstraintSet            execution_constraints;
-      TaskLayoutConstraintSet           layout_constraints;
-    public:
-      const void*                       user_data;
-      size_t                            user_data_size;
-    public:
-      const char*                       name;
     };
 
     //==========================================================================
@@ -2159,6 +2096,8 @@ namespace Legion {
       // These methods can only be accessed by the FieldAccessor class
       template<PrivilegeMode, typename, int, typename, typename, bool>
       friend class FieldAccessor;
+      template<typename, bool, int, typename, typename, bool>
+      friend class ReductionAccessor;
       template<typename, int, typename, typename>
       friend class UnsafeFieldAccessor;
       Realm::RegionInstance get_instance_info(PrivilegeMode mode, 
@@ -2183,31 +2122,31 @@ namespace Legion {
      * default version of this class is empty, but the following
      * specializations of this class with different privilege modes
      * will provide different methods specific to that privilege type
+     * The ReduceAccessor class should be used for explicit reductions
      *
      * READ_ONLY
      *  - FT read(const Point<N,T>&) const
      *  - const FT* ptr(const Point<N,T>&) const (Affine Accessor only)
      *  - const FT* ptr(const Rect<N,T>&) const (Affine Accessor only)
+     *  - FT* ptr(const Rect<N,T>&, size_t strides[N]) const (Affine only)
      *  - const FT& operator[](const Point<N,T>&) const (Affine Accessor only)
      *
      * READ_WRITE
      *  - FT read(const Point<N,T>&) const
      *  - void write(const Point<N,T>&, FT val) const
      *  - FT* ptr(const Point<N,T>&) const (Affine Accessor only)
-     *  - FT* ptr(const Rect<N,T>&) const (Affine Accessor only)
+     *  - FT* ptr(const Rect<N,T>&) const (Affine Accessor only, must be dense)
+     *  - FT* ptr(const Rect<N,T>&, size_t strides[N]) const (Affine only)
      *  - FT& operator[](const Point<N,T>&) const (Affine Accessor only)
-     *  - template<typename REDOP> void reduce(const Point<N,T>&, REDOP::RHS);
-     *    (Affine Accessor only)
+     *  - template<typename REDOP, bool EXCLUSIVE> 
+     *      void reduce(const Point<N,T>&, REDOP::RHS); (Affine Accessor only)
      *
      *  WRITE_DISCARD
      *  - void write(const Point<N,T>&, FT val) const
      *  - FT* ptr(const Point<N,T>&) const (Affine Accessor only)
      *  - FT* ptr(const Rect<N,T>&) const (Affine Accessor only)
+     *  - FT* ptr(const Rect<N,T>&, size_t strides[N]) const (Affine only)
      *  - FT& operator[](const Point<N,T>&) const (Affine Accessor only)
-     *
-     * REDUCE
-     *  - template<typename REDOP> void reduce(const Point<N,T>&, REDOP::RHS)
-     *    (Affine Accessor only)
      */
     template<PrivilegeMode MODE, typename FT, int N, typename COORD_T = coord_t,
              typename A = Realm::GenericAccessor<FT,N,COORD_T>,
@@ -2271,6 +2210,114 @@ namespace Legion {
                     bool check_field_size = false,
 #endif
                     bool silence_warnings = false) { }
+    };
+
+    /**
+     * \class ReductionAccessor
+     * A field accessor is a class used to perform reductions to a given
+     * field inside a PhysicalRegion object for a specific field. Reductions
+     * can be performed directly or array indexing can be used along with 
+     * the <<= operator to perform the reduction. We also provide the same
+     * variants of the 'ptr' method as normal accessors to obtain a pointer 
+     * to the underlying allocation. This seems to be useful when we need
+     * to do reductions directly to a buffer as is often necessary when
+     * invoking external libraries like BLAS.
+     * This method currently only works with the Realm::AffineAccessor layout
+     */
+    template<typename REDOP, bool EXCLUSIVE, int N, typename COORD_T = coord_t,
+             typename A = Realm::GenericAccessor<typename REDOP::RHS,N,COORD_T>,
+#ifdef BOUNDS_CHECKS
+             bool CHECK_BOUNDS = true>
+#else
+             bool CHECK_BOUNDS = false>
+#endif
+    class ReductionAccessor {
+    public:
+      ReductionAccessor(void) { }
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop, bool silence_warnings = false) { }
+      // For Realm::AffineAccessor specializations there are additional
+      // methods for creating accessors with limited bounding boxes and
+      // affine transformations for using alternative coordinates spaces
+      // Specify a specific bounds rectangle to use for the accessor
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop, 
+                        const Rect<N,COORD_T> bounds,
+                        bool silence_warnings = false) { }
+      // Specify a specific Affine transform to use for interpreting points
+      template<int M>
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop,
+                        const AffineTransform<M,N,COORD_T> transform,
+                        bool silence_warnings = false) { }
+      // Specify both a transform and a bounds to use
+      template<int M>
+      ReductionAccessor(const PhysicalRegion &region, FieldID fid,
+                        ReductionOpID redop,
+                        const AffineTransform<M,N,COORD_T> transform,
+                        const Rect<N,COORD_T> bounds,
+                        bool silence_warnings = false) { }
+    };
+
+    /**
+     * \class DeferredValue
+     * A deferred value is a special helper class for handling return values 
+     * for tasks that do asynchronous operations (e.g. GPU kernel launches), 
+     * but we don't want to wait for the asynchronous operations to be returned. 
+     * This object should be returned directly as the result of a Legion task, 
+     * but its value will not be read until all of the "effects" of the task 
+     * are done. It is important that this object be returned from the task in
+     * order to ensure its memory is cleaned up. Not returning any created
+     * DeferredValue objects will result in a memory leak. It supports the 
+     * following methods during task execution:
+     *  - T read(void) const
+     *  - void write(T val) const
+     *  - T* ptr(void) const
+     *  - T& operator(void) const
+     */
+    template<typename T>
+    class DeferredValue {
+    public:
+      DeferredValue(T initial_value);
+    public:
+      __CUDA_HD__
+      inline T read(void) const;
+      __CUDA_HD__
+      inline void write(T value);
+      __CUDA_HD__
+      inline T* ptr(void);
+      __CUDA_HD__
+      inline T& ref(void);
+      __CUDA_HD__
+      inline operator T(void) const;
+      __CUDA_HD__
+      inline DeferredValue<T>& operator=(T value);
+    public:
+      inline void finalize(InternalContext ctx) const;
+    protected:
+      Realm::RegionInstance instance;
+      Realm::AffineAccessor<T,1,coord_t> accessor;
+    };
+
+    /**
+     * \class DeferredReduction 
+     * This is a special case of a DeferredValue that also supports
+     * a reduction operator. It should be returned directly as the
+     * result of a Legion task. It supports all the same methods
+     * as the DeferredValue as well as an additional method for
+     * doing reductions using a reduction operator.
+     *  - void reduce(REDOP::RHS val)
+     *  - void <<=(REDOP::RHS val)
+     */
+    template<typename REDOP, bool EXCLUSIVE=false>
+    class DeferredReduction: public DeferredValue<typename REDOP::RHS> {
+    public:
+      DeferredReduction(void);
+    public:
+      __CUDA_HD__
+      inline void reduce(typename REDOP::RHS val);
+      __CUDA_HD__
+      inline void operator<<=(typename REDOP::RHS val);
     };
  
     //==========================================================================
@@ -2495,6 +2542,7 @@ namespace Legion {
         CLOSE_MAPPABLE,
         FILL_MAPPABLE,
         PARTITION_MAPPABLE,
+        DYNAMIC_COLLECTIVE_MAPPABLE,
       };
       virtual MappableType get_mappable_type(void) const = 0;
       virtual const Task* as_task(void) const = 0;
@@ -2505,9 +2553,14 @@ namespace Legion {
       virtual const Close* as_close(void) const = 0;
       virtual const Fill* as_fill(void) const = 0;
       virtual const Partition* as_partition(void) const = 0;
+      virtual const DynamicCollective* as_dynamic_collective(void) const = 0;
     public:
       MapperID                                  map_id;
       MappingTagID                              tag;
+    public:
+      // Mapper annotated data 
+      void*                                     mapper_data;
+      size_t                                    mapper_data_size;
     };
 
     /**
@@ -2535,6 +2588,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Task argument information
       Processor::TaskFuncID task_id; 
@@ -2587,10 +2642,14 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Copy Launcher arguments
       std::vector<RegionRequirement>    src_requirements;
       std::vector<RegionRequirement>    dst_requirements;
+      std::vector<RegionRequirement>    src_indirect_requirements;
+      std::vector<RegionRequirement>    dst_indirect_requirements;
       std::vector<Grant>                grants;
       std::vector<PhaseBarrier>         wait_barriers;
       std::vector<PhaseBarrier>         arrive_barriers;
@@ -2624,6 +2683,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Inline Launcher arguments
       RegionRequirement                 requirement;
@@ -2656,6 +2717,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Acquire Launcher arguments
       LogicalRegion                     logical_region;
@@ -2689,6 +2752,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Release Launcher arguments
       LogicalRegion                     logical_region;
@@ -2726,6 +2791,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return this; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Synthesized region requirement
       RegionRequirement                 requirement;
@@ -2755,6 +2822,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return this; }
       virtual const Partition* as_partition(void) const { return NULL; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       // Synthesized region requirement
       RegionRequirement               requirement;
@@ -2793,6 +2862,8 @@ namespace Legion {
       virtual const Close* as_close(void) const { return NULL; }
       virtual const Fill* as_fill(void) const { return NULL; }
       virtual const Partition* as_partition(void) const { return this; }
+      virtual const DynamicCollective* as_dynamic_collective(void) const
+        { return NULL; }
     public:
       enum PartitionKind {
         BY_FIELD, // create partition by field
@@ -4449,12 +4520,14 @@ namespace Legion {
        * @return handle for the logical region created
        */
       LogicalRegion create_logical_region(Context ctx, IndexSpace index, 
-                                          FieldSpace fields);
+                                          FieldSpace fields,
+                                          bool task_local = false);
       // Template version
       template<int DIM, typename COORD_T>
       LogicalRegionT<DIM,COORD_T> create_logical_region(Context ctx,
                                       IndexSpaceT<DIM,COORD_T> index,
-                                      FieldSpace fields);
+                                      FieldSpace fields,
+                                      bool task_local = false);
       /**
        * Destroy a logical region and all of its logical sub-regions.
        * @param ctx enclosing task context
@@ -5134,8 +5207,9 @@ namespace Legion {
        * Detach an external resource from a logical region
        * @param ctx enclosing task context
        * @param the physical region for the external resource
+       * @return an empty future indicating when the resource is detached
        */
-      void detach_external_resource(Context ctx, PhysicalRegion region);
+      Future detach_external_resource(Context ctx, PhysicalRegion region);
 
       /**
        * @deprecated
@@ -5519,7 +5593,7 @@ namespace Legion {
        * The trace ID need only be local to the enclosing context.
        * Traces are currently not permitted to be nested.
        */
-      void begin_trace(Context ctx, TraceID tid);
+      void begin_trace(Context ctx, TraceID tid, bool logical_only = false);
       /**
        * Mark the end of trace that was being performed.
        */
@@ -6095,6 +6169,18 @@ namespace Legion {
       MapperID generate_dynamic_mapper_id(void);
 
       /**
+       * Generate a contiguous set of MapperIDs for use by a library.
+       * This call will always generate the same answer for the same library
+       * name no many how many times it is called or on how many nodes it
+       * is called. If the count passed in to this method differs for the 
+       * same library name the runtime will raise an error.
+       * @param name a unique null-terminated string that names the library
+       * @param count the number of mapper IDs that should be generated
+       * @return the first mapper ID that is allocated to the library
+       */
+      MapperID generate_library_mapper_ids(const char *name, size_t count);
+
+      /**
        * Statically generate a unique Mapper ID for use across the machine.
        * This can only be called prior to the runtime starting. It must
        * be invoked symmetrically across all nodes in the machine prior
@@ -6138,6 +6224,19 @@ namespace Legion {
        */
       ProjectionID generate_dynamic_projection_id(void);
 
+      /** 
+       * Generate a contiguous set of ProjectionIDs for use by a library.
+       * This call will always generate the same answer for the same library
+       * name no many how many times it is called or on how many nodes it
+       * is called. If the count passed in to this method differs for the 
+       * same library name the runtime will raise an error.
+       * @param name a unique null-terminated string that names the library
+       * @param count the number of projection IDs that should be generated
+       * @return the first projection ID that is allocated to the library
+       */
+      ProjectionID generate_library_projection_ids(const char *name, 
+                                                   size_t count);
+
       /**
        * Statically generate a unique Projection ID for use across the machine.
        * This can only be called prior to the runtime starting. It must be
@@ -6157,9 +6256,11 @@ namespace Legion {
        * functor after the application has finished executing.
        * @param pid the projection ID to use for the registration
        * @param functor the object to register for handling projections
+       * @param silence_warnings disable warnings about dynamic registration
        */
       void register_projection_functor(ProjectionID pid, 
-                                       ProjectionFunctor *functor);
+                                       ProjectionFunctor *functor,
+                                       bool silence_warnings = false);
 
       /**
        * Register a projection functor before the runtime has started only.
@@ -6209,6 +6310,9 @@ namespace Legion {
        * -lg:sched <int> The run-ahead factor for the runtime.  How many
        *              outstanding tasks ready to run should be on each
        *              processor before backing off the mapping procedure.
+       * -lg:vector <int> Set the initial vectorization option for fusing
+       *              together important runtime meta tasks in the mapper.
+       *              The default is 16.
        * -lg:inorder  Execute operations in strict propgram order. This
        *              flag will actually run the entire operation through
        *              the pipeline and wait for it to complete before
@@ -6329,6 +6433,20 @@ namespace Legion {
        * @return only if running in background, otherwise never
        */
       static int start(int argc, char **argv, bool background = false);
+
+      /**
+       * This 'initialize' method is an optional method that provides
+       * users a way to look at the command line arguments before they
+       * actually start the Legion runtime. Users will still need to 
+       * call 'start' in order to actually start the Legion runtime but
+       * this way they can do some static initialization and use their
+       * own command line parameters to initialize the runtime prior
+       * to actually starting it. The resulting 'argc' and 'argv' should
+       * be passed into the 'start' method or undefined behavior will occur.
+       * @param argc pointer to an integer in which to store the argument count 
+       * @param argv pointer to array of strings for storing command line args
+       */
+      static void initialize(int *argc, char ***argv);
 
       /**
        * Blocking call to wait for the runtime to shutdown when
@@ -6555,6 +6673,18 @@ namespace Legion {
       TaskID generate_dynamic_task_id(void);
 
       /**
+       * Generate a contiguous set of TaskIDs for use by a library.
+       * This call will always generate the same answer for the same library
+       * name no many how many times it is called or on how many nodes it
+       * is called. If the count passed in to this method differs for the 
+       * same library name the runtime will raise an error.
+       * @param name a unique null-terminated string that names the library
+       * @param count the number of task IDs that should be generated
+       * @return the first task ID that is allocated to the library
+       */
+      TaskID generate_library_task_ids(const char *name, size_t count);
+
+      /**
        * Statically generate a unique Task ID for use across the machine.
        * This can only be called prior to the runtime starting. It must
        * be invoked symmetrically across all nodes in the machine prior
@@ -6753,40 +6883,6 @@ namespace Legion {
                                         const void *retvalptr = NULL,
                                         size_t retvalsize = 0);
     public:
-      //------------------------------------------------------------------------
-      // Task Generator Registration Operations
-      //------------------------------------------------------------------------
-     
-      /**
-       * Dynamically generate a unique generator ID for use across the machine.
-       * @return a Generator ID that is globally unique across the machine
-       */
-      GeneratorID generate_dynamic_generator_id(void);
-
-      /**
-       * Statically generate a unique Generator ID for use across the machine.
-       * This can only be called prior to the runtime starting. It must be 
-       * invoked symmetrically across all nodes in the machine prior to 
-       * starting the runtime.
-       * @return a Generator ID that is globally unique across the machine
-       */
-      static GeneratorID generate_static_generator_id(void);
-
-      /**
-       * Dynamically register a new task generator function with the runtime
-       * @param registrar the task generator registrar
-       */
-      void register_task_generator(const TaskGeneratorRegistrar &registrar);
-
-      /**
-       * Statically register a new task generator function with the runtime.
-       * This call must be made on all nodes and it will fail if done after
-       * the runtime has been started.
-       * @param registrar the task generator registrar
-       */
-      static void preregister_task_generator(
-                                   const TaskGeneratorRegistrar &registrar);
-    public:
       // ------------------ Deprecated task registration -----------------------
       /**
        * @deprecated
@@ -6895,17 +6991,14 @@ namespace Legion {
        * @return the Legion runtime pointer for the specified processor
        */
       static Runtime* get_runtime(Processor p = Processor::NO_PROC);
-#ifdef ENABLE_LEGION_TLS
+
       /**
-       * Provisional support for a way to implicitly find the context
-       * of the task in which we are running. This is only supported
-       * if the runtime is built with the ENABLE_LEGION_TLS macro.
-       * This macro has not been performance tested and may cause 
-       * performance degradation in the runtime. Use at your own risk.
+       * Get the context for the currently executing task this must
+       * be called inside of an actual Legion task. Calling it outside
+       * of a Legion task will result in undefined behavior
        * @return the context for the enclosing task in which we are executing
        */
       static Context get_context(void);
-#endif
     private:
       // Helper methods for templates
       IndexSpace create_index_space_internal(Context ctx, const void *realm_is,

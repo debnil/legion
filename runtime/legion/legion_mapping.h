@@ -70,6 +70,7 @@ namespace Legion {
       bool is_normal_instance(void) const;
       bool is_virtual_instance(void) const;
       bool is_reduction_instance(void) const;
+      bool is_external_instance(void) const;
     public:
       bool has_field(FieldID fid) const;
       void has_fields(std::map<FieldID,bool> &fids) const;
@@ -115,7 +116,7 @@ namespace Legion {
     class MapperEvent {
     public:
       MapperEvent(void)
-        : impl(RtUserEvent::NO_RT_USER_EVENT) { }
+        : impl(Internal::RtUserEvent::NO_RT_USER_EVENT) { }
       FRIEND_ALL_RUNTIME_CLASSES
     public:
       inline bool exists(void) const { return impl.exists(); }
@@ -124,7 +125,7 @@ namespace Legion {
       inline bool operator<(const MapperEvent &rhs) const
         { return (impl.id < rhs.impl.id); }
     private:
-      RtUserEvent impl;
+      Internal::RtUserEvent impl;
     };
 
     namespace ProfilingMeasurements {
@@ -198,6 +199,24 @@ namespace Legion {
 
       const Realm::ProfilingResponse *realm_resp;
       ProfilingMeasurements::RuntimeOverhead *overhead;
+    };
+
+    /**
+     * \struct TaskGeneratorArguments
+     * This structure defines the arguments that will be passed to a 
+     * task generator variant from a call to find_or_create_variant
+     * if the no variant could be found. The task generator function 
+     * will then be expected to generate one or more variants and 
+     * register them with the runtime. The first variant registered
+     * will be the one that the runtime will use to satisfy the
+     * mapper request.
+     */
+    struct TaskGeneratorArguments {
+    public:
+      TaskID                            task_id;
+      MapperID                          mapper_id;
+      ExecutionConstraintSet            execution_constraints;
+      TaskLayoutConstraintSet           layout_constraints;
     };
 
     /**
@@ -309,6 +328,7 @@ namespace Legion {
         bool                                   inline_task;  // = false
         bool                                   stealable;   // = false
         bool                                   map_locally;  // = false
+        bool                                   memoize;  // = false
         TaskPriority                           parent_priority; // = current
       };
       //------------------------------------------------------------------------
@@ -777,14 +797,18 @@ namespace Legion {
        * layouts of the physical instances to be used in the 
        */
       struct MapCopyInput {
-        std::vector<std::vector<PhysicalInstance> >       src_instances;
-        std::vector<std::vector<PhysicalInstance> >       dst_instances;
+        std::vector<std::vector<PhysicalInstance> >     src_instances;
+        std::vector<std::vector<PhysicalInstance> >     dst_instances;
+        std::vector<std::vector<PhysicalInstance> >     src_indirect_instances;
+        std::vector<std::vector<PhysicalInstance> >     dst_indirect_instances;
       };
       struct MapCopyOutput {
-        std::vector<std::vector<PhysicalInstance> >       src_instances;
-        std::vector<std::vector<PhysicalInstance> >       dst_instances;
-        ProfilingRequest                                  profiling_requests;
-        TaskPriority                                      profiling_priority;
+        std::vector<std::vector<PhysicalInstance> >     src_instances;
+        std::vector<std::vector<PhysicalInstance> >     dst_instances;
+        std::vector<PhysicalInstance>                   src_indirect_instances;
+        std::vector<PhysicalInstance>                   dst_indirect_instances;
+        ProfilingRequest                                profiling_requests;
+        TaskPriority                                    profiling_priority;
       };
       //------------------------------------------------------------------------
       virtual void map_copy(const MapperContext      ctx,
@@ -1336,6 +1360,13 @@ namespace Legion {
        * enough ahead that it can be halted for this context by setting
        * the 'min_tasks_to_schedule' parameter.
        *
+       * the mapper can control the granularity of Legion meta-tasks
+       * for this context with the 'meta_task_vector_width' parameter
+       * which control how many meta-tasks get batched together for 
+       * certain stages of the execution pipeline. This is useful to 
+       * avoid the overheads of Realm tasks which often do not deal
+       * with very small meta-tasks (e.g. those that take 20us or less).
+       *
        * The 'mutable_priority' parameter allows the mapper to specify
        * whether child operations launched in this context are permitted
        * to alter the priority of parent task. See the 'update_parent_priority'
@@ -1349,6 +1380,7 @@ namespace Legion {
         unsigned                                max_outstanding_frames; // = 2
         unsigned                                min_tasks_to_schedule; // = 64
         unsigned                                min_frames_to_schedule; // = 0 
+        unsigned                                meta_task_vector_width; // = 16
         bool                                    mutable_priority; // = false
       };
       //------------------------------------------------------------------------
@@ -1440,6 +1472,30 @@ namespace Legion {
                                       const MapDataflowGraphInput&  input,
                                             MapDataflowGraphOutput& output) = 0;
       //------------------------------------------------------------------------
+
+    public: // Memoizing physical analyses of operations
+      /**
+       * ----------------------------------------------------------------------
+       *  Memoize Operation
+       * ----------------------------------------------------------------------
+       * The memoize_operation mapper call asks the mapper to decide if the
+       * physical analysis of the operation should be memoized. Operations
+       * that are not being logically traced cannot be memoized.
+       *
+       */
+      struct MemoizeInput {
+        TraceID trace_id;
+      };
+      struct MemoizeOutput {
+        bool memoize;
+      };
+      //------------------------------------------------------------------------
+      virtual void memoize_operation(const MapperContext  ctx,
+                                     const Mappable&      mappable,
+                                     const MemoizeInput&  input,
+                                           MemoizeOutput& output) = 0;
+      //------------------------------------------------------------------------
+
     public: // Mapping control 
       /**
        * ----------------------------------------------------------------------
@@ -1614,6 +1670,18 @@ namespace Legion {
       void disable_reentrant(MapperContext ctx) const;
     public:
       //------------------------------------------------------------------------
+      // Methods for updating mappable data 
+      // The mapper is responsible for atomicity of these calls 
+      // (usually through the choice of mapper synchronization model) 
+      //------------------------------------------------------------------------
+      void update_mappable_tag(MapperContext ctx, const Mappable &mappable, 
+                               MappingTagID new_tag) const;
+      // Runtime will make a copy of the data passed into this method
+      void update_mappable_data(MapperContext ctx, const Mappable &mappable,
+                                const void *mapper_data, 
+                                size_t mapper_data_size) const;
+    public:
+      //------------------------------------------------------------------------
       // Methods for communicating with other mappers of the same kind
       //------------------------------------------------------------------------
       void send_message(MapperContext ctx, Processor target,const void *message,
@@ -1676,8 +1744,16 @@ namespace Legion {
       // Methods for manipulating variants 
       //------------------------------------------------------------------------
       void find_valid_variants(MapperContext ctx, TaskID task_id, 
-                                         std::vector<VariantID> &valid_variants,
+                               std::vector<VariantID> &valid_variants,
                                Processor::Kind kind = Processor::NO_KIND) const;
+      void find_generator_variants(MapperContext ctx, TaskID task_id,
+                  std::vector<std::pair<TaskID,VariantID> > &generator_variants,
+                  Processor::Kind kind = Processor::NO_KIND) const;
+      VariantID find_or_create_variant(MapperContext ctx, TaskID task_id,
+                             const ExecutionConstraintSet &execution_constrains,
+                             const TaskLayoutConstraintSet &layout_constraints,
+                             TaskID generator_tid, VariantID generator_vid, 
+                             Processor generator_processor, bool &created) const;
       bool is_leaf_variant(MapperContext ctx, TaskID task_id,
                                      VariantID variant_id) const;
       bool is_inner_variant(MapperContext ctx, TaskID task_id,
@@ -1837,6 +1913,9 @@ namespace Legion {
 
       Color get_index_space_color(MapperContext ctx, 
                                             IndexSpace handle) const;
+
+      DomainPoint get_index_space_color_point(MapperContext ctx,
+                                              IndexSpace handle) const;
 
       Color get_index_partition_color(MapperContext ctx, 
                                                 IndexPartition handle) const;

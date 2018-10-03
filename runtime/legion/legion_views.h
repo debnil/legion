@@ -74,6 +74,7 @@ namespace Legion {
     public:
       void defer_collect_user(ApEvent term_event, ReferenceMutator *mutator);
       virtual void collect_users(const std::set<ApEvent> &term_events) = 0;
+      virtual void update_gc_events(const std::set<ApEvent> &term_events) = 0;
       static void handle_deferred_collect(LogicalView *view,
                                           const std::set<ApEvent> &term_events);
     public:
@@ -93,7 +94,7 @@ namespace Legion {
       RegionTreeForest *const context;
       RegionTreeNode *const logical_node;
     protected:
-      Reservation view_lock;
+      mutable LocalLock view_lock;
     };
 
     /**
@@ -135,6 +136,7 @@ namespace Legion {
                                            const AddressSpaceID source,
                      LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                                            std::set<RtEvent> &applied_events,
+                                           PhysicalTraceInfo &trace_info,
                                            bool can_filter = true) = 0;
       virtual void add_copy_user(ReductionOpID redop, ApEvent copy_term,
                                  VersionTracker *version_tracker,
@@ -142,18 +144,21 @@ namespace Legion {
                                  const unsigned index, const FieldMask &mask, 
                                  bool reading, bool restrict_out,
                                  const AddressSpaceID source,
-                                 std::set<RtEvent> &applied_events) = 0;
+                                 std::set<RtEvent> &applied_events,
+                                 PhysicalTraceInfo &trace_info) = 0;
       virtual ApEvent find_user_precondition(const RegionUsage &user,
                                            ApEvent term_event,
                                            const FieldMask &user_mask,
                                            Operation *op, const unsigned index,
                                            VersionTracker *version_tracker,
-                                           std::set<RtEvent> &applied_events) = 0;
+                                           std::set<RtEvent> &applied_events,
+                                           PhysicalTraceInfo &trace_info) = 0;
       virtual void add_user(const RegionUsage &user, ApEvent term_event,
                             const FieldMask &user_mask, Operation *op,
                             const unsigned index, AddressSpaceID source,
                             VersionTracker *version_tracker,
-                            std::set<RtEvent> &applied_events) = 0;
+                            std::set<RtEvent> &applied_events,
+                            PhysicalTraceInfo &trace_info) = 0;
       // This is a fused version of the above two methods
       virtual ApEvent add_user_fused(const RegionUsage &user,
                                    ApEvent term_event,
@@ -162,6 +167,7 @@ namespace Legion {
                                    VersionTracker *version_tracker,
                                    const AddressSpaceID source,
                                    std::set<RtEvent> &applied_events,
+                                   PhysicalTraceInfo &trace_info,
                                    bool update_versions = true) = 0;
       virtual void add_initial_user(ApEvent term_event,
                                     const RegionUsage &usage,
@@ -322,6 +328,7 @@ namespace Legion {
                                            const AddressSpaceID source,
                          LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                                            std::set<RtEvent> &applied_events,
+                                           PhysicalTraceInfo &trace_info,
                                            bool can_filter = true);
     protected: 
       void find_copy_preconditions_above(ReductionOpID redop, bool reading,
@@ -334,7 +341,8 @@ namespace Legion {
                                          const unsigned index,
                                          const AddressSpaceID source,
                        LegionMap<ApEvent,FieldMask>::aligned &preconditions,
-                                         std::set<RtEvent> &applied_events);
+                                         std::set<RtEvent> &applied_events,
+                                         PhysicalTraceInfo &trace_info);
       friend class CompositeView;
       // Give composite views special access here so they can filter
       // back just the users at the particular level
@@ -348,7 +356,8 @@ namespace Legion {
                                          const unsigned index,
                                          const AddressSpaceID source,
                            LegionMap<ApEvent,FieldMask>::aligned &preconditions,
-                                         std::set<RtEvent> &applied_events);
+                                         std::set<RtEvent> &applied_events,
+                                         PhysicalTraceInfo &trace_info);
       void find_local_copy_preconditions_above(ReductionOpID redop,bool reading,
                                          bool single_copy, bool restrict_out,
                                          const FieldMask &copy_mask,
@@ -360,6 +369,7 @@ namespace Legion {
                                          const AddressSpaceID source,
                            LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                                          std::set<RtEvent> &applied_events,
+                                         PhysicalTraceInfo &trace_info,
                                          const bool actually_above = true);
     public:
       virtual void add_copy_user(ReductionOpID redop, ApEvent copy_term,
@@ -369,7 +379,8 @@ namespace Legion {
                                  const FieldMask &mask, 
                                  bool reading, bool restrict_out,
                                  const AddressSpaceID source,
-                                 std::set<RtEvent> &applied_events);
+                                 std::set<RtEvent> &applied_events,
+                                 PhysicalTraceInfo &trace_info);
     protected:
       void add_copy_user_above(const RegionUsage &usage, ApEvent copy_term,
                                const LegionColor child_color,
@@ -379,7 +390,8 @@ namespace Legion {
                                const unsigned index, const bool restrict_out,
                                const FieldMask &copy_mask,
                                const AddressSpaceID source,
-                               std::set<RtEvent> &applied_events);
+                               std::set<RtEvent> &applied_events,
+                               PhysicalTraceInfo &trace_info);
       void add_local_copy_user(const RegionUsage &usage, ApEvent copy_term,
                                bool base_user, bool restrict_out,
                                const LegionColor child_color,
@@ -389,14 +401,16 @@ namespace Legion {
                                const unsigned index,
                                const FieldMask &copy_mask,
                                const AddressSpaceID source,
-                               std::set<RtEvent> &applied_events);
+                               std::set<RtEvent> &applied_events,
+                               PhysicalTraceInfo &trace_info);
     public:
       virtual ApEvent find_user_precondition(const RegionUsage &user,
                                            ApEvent term_event,
                                            const FieldMask &user_mask,
                                            Operation *op, const unsigned index,
                                            VersionTracker *version_tracker,
-                                           std::set<RtEvent> &applied_events);
+                                           std::set<RtEvent> &applied_events,
+                                           PhysicalTraceInfo &trace_info);
     protected:
       void find_user_preconditions_above(const RegionUsage &usage,
                                          ApEvent term_event,
@@ -407,7 +421,8 @@ namespace Legion {
                                          const unsigned index,
                                          const FieldMask &user_mask,
                                          std::set<ApEvent> &preconditions,
-                                         std::set<RtEvent> &applied_events);
+                                         std::set<RtEvent> &applied_events,
+                                         PhysicalTraceInfo &trace_info);
       void find_local_user_preconditions(const RegionUsage &usage,
                                          ApEvent term_event,
                                          const LegionColor child_color,
@@ -417,7 +432,8 @@ namespace Legion {
                                          const unsigned index,
                                          const FieldMask &user_mask,
                                          std::set<ApEvent> &preconditions,
-                                         std::set<RtEvent> &applied_events);
+                                         std::set<RtEvent> &applied_events,
+                                         PhysicalTraceInfo &trace_info);
       void find_local_user_preconditions_above(const RegionUsage &usage,
                                          ApEvent term_event,
                                          const LegionColor child_color,
@@ -428,13 +444,15 @@ namespace Legion {
                                          const FieldMask &user_mask,
                                          std::set<ApEvent> &preconditions,
                                          std::set<RtEvent> &applied_events,
+                                         PhysicalTraceInfo &trace_info,
                                          const bool actually_above = true);
     public:
       virtual void add_user(const RegionUsage &user, ApEvent term_event,
                             const FieldMask &user_mask, Operation *op,
                             const unsigned index, AddressSpaceID source,
                             VersionTracker *version_tracker,
-                            std::set<RtEvent> &applied_events);
+                            std::set<RtEvent> &applied_events,
+                            PhysicalTraceInfo &trace_info);
     protected:
       void add_user_above(const RegionUsage &usage, ApEvent term_event,
                           const LegionColor child_color, 
@@ -444,7 +462,8 @@ namespace Legion {
                           const FieldMask &user_mask,
                           const bool need_version_update,
                           const AddressSpaceID source,
-                          std::set<RtEvent> &applied_events);
+                          std::set<RtEvent> &applied_events,
+                          PhysicalTraceInfo &trace_info);
       bool add_local_user(const RegionUsage &usage, ApEvent term_event,
                           const LegionColor child_color, 
                           RegionNode *origin_node, const bool base_user,
@@ -452,7 +471,8 @@ namespace Legion {
                           const UniqueID op_id, const unsigned index,
                           const FieldMask &user_mask,
                           const AddressSpaceID source,
-                          std::set<RtEvent> &applied_events);
+                          std::set<RtEvent> &applied_events,
+                          PhysicalTraceInfo &trace_info);
     public:
       // This is a fused version of the above two virtual methods
       virtual ApEvent add_user_fused(const RegionUsage &user, 
@@ -462,6 +482,7 @@ namespace Legion {
                                    VersionTracker *version_tracker,
                                    const AddressSpaceID source,
                                    std::set<RtEvent> &applied_events,
+                                   PhysicalTraceInfo &trace_info,
                                    bool update_versions = true);
     protected:
       void add_user_above_fused(const RegionUsage &usage, ApEvent term_event,
@@ -474,6 +495,7 @@ namespace Legion {
                                 const AddressSpaceID source,
                                 std::set<ApEvent> &preconditions,
                                 std::set<RtEvent> &applied_events,
+                                PhysicalTraceInfo &trace_info,
                                 const bool need_version_update);
     public:
       virtual void add_initial_user(ApEvent term_event,
@@ -487,6 +509,7 @@ namespace Legion {
       virtual void notify_valid(ReferenceMutator *mutator);
       virtual void notify_invalid(ReferenceMutator *mutator);
       virtual void collect_users(const std::set<ApEvent> &term_users);
+      virtual void update_gc_events(const std::set<ApEvent> &term_events);
     public:
       virtual void send_view(AddressSpaceID target); 
       void update_gc_events(const std::deque<ApEvent> &gc_events);
@@ -544,7 +567,8 @@ namespace Legion {
                                       std::set<ApEvent> &dead_events,
                   LegionMap<ApEvent,FieldMask>::aligned &filter_events,
                                       FieldMask &observed, 
-                                      FieldMask &non_dominated);
+                                      FieldMask &non_dominated,
+                                      PhysicalTraceInfo &trace_info);
       void find_previous_preconditions(const FieldMask &user_mask,
                                       const RegionUsage &usage,
                                       const LegionColor child_color,
@@ -553,7 +577,8 @@ namespace Legion {
                                       const UniqueID op_id,
                                       const unsigned index,
                                       std::set<ApEvent> &preconditions,
-                                      std::set<ApEvent> &dead_events);
+                                      std::set<ApEvent> &dead_events,
+                                      PhysicalTraceInfo &trace_info);
       // Overloaded versions for being precise about copy preconditions
       template<bool TRACK_DOM>
       void find_current_preconditions(const FieldMask &user_mask,
@@ -566,7 +591,8 @@ namespace Legion {
                                       std::set<ApEvent> &dead_events,
                   LegionMap<ApEvent,FieldMask>::aligned &filter_events,
                                       FieldMask &observed, 
-                                      FieldMask &non_dominated);
+                                      FieldMask &non_dominated,
+                                      PhysicalTraceInfo &trace_info);
       void find_previous_preconditions(const FieldMask &user_mask,
                                       const RegionUsage &usage,
                                       const LegionColor child_color,
@@ -574,7 +600,8 @@ namespace Legion {
                                       const UniqueID op_id,
                                       const unsigned index,
                   LegionMap<ApEvent,FieldMask>::aligned &preconditions,
-                                      std::set<ApEvent> &dead_events);
+                                      std::set<ApEvent> &dead_events,
+                                      PhysicalTraceInfo &trace_info);
       void find_previous_filter_users(const FieldMask &dominated_mask,
                   LegionMap<ApEvent,FieldMask>::aligned &filter_events);
       inline bool has_local_precondition(PhysicalUser *prev_user,
@@ -755,13 +782,16 @@ namespace Legion {
                              VersionTracker *version_tracker, 
                              Operation *op, unsigned index,
                              std::set<RtEvent> &map_applied_events,
-                             PredEvent pred_guard, bool restrict_out = false);
+                             PredEvent pred_guard,
+                             PhysicalTraceInfo &trace_info,
+                             bool restrict_out = false);
       ApEvent perform_deferred_reduction(MaterializedView *target,
                                         const FieldMask &copy_mask,
                                         VersionTracker *version_tracker,
                                         const std::set<ApEvent> &preconditions,
                                         Operation *op, unsigned index,
                                         PredEvent predicate_guard,
+                                        PhysicalTraceInfo &trace_info,
                                         CopyAcrossHelper *helper,
                                         RegionTreeNode *intersect,
                                         std::set<RtEvent> &map_applied_events);
@@ -774,7 +804,8 @@ namespace Legion {
                                        Operation *op, unsigned index,
                                        PredEvent predicate_guard,
                                        RegionTreeNode *intersect,
-                                       std::set<RtEvent> &map_applied_events);
+                                       std::set<RtEvent> &map_applied_events,
+                                       PhysicalTraceInfo &trace_info);
     public:
       virtual bool has_manager(void) const { return true; } 
       virtual PhysicalManager* get_manager(void) const;
@@ -796,6 +827,7 @@ namespace Legion {
                                            const AddressSpaceID source,
                          LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                                            std::set<RtEvent> &applied_events,
+                                           PhysicalTraceInfo &trace_info,
                                            bool can_filter = true);
       virtual void add_copy_user(ReductionOpID redop, ApEvent copy_term,
                                  VersionTracker *version_tracker,
@@ -804,18 +836,21 @@ namespace Legion {
                                  const FieldMask &mask, 
                                  bool reading, bool restrict_out,
                                  const AddressSpaceID source,
-                                 std::set<RtEvent> &applied_events);
+                                 std::set<RtEvent> &applied_events,
+                                 PhysicalTraceInfo &trace_info);
       virtual ApEvent find_user_precondition(const RegionUsage &user,
                                            ApEvent term_event,
                                            const FieldMask &user_mask,
                                            Operation *op, const unsigned index,
                                            VersionTracker *version_tracker,
-                                           std::set<RtEvent> &applied_events);
+                                           std::set<RtEvent> &applied_events,
+                                           PhysicalTraceInfo &trace_info);
       virtual void add_user(const RegionUsage &user, ApEvent term_event,
                             const FieldMask &user_mask, Operation *op,
                             const unsigned index, AddressSpaceID source,
                             VersionTracker *version_tracker,
-                            std::set<RtEvent> &applied_events);
+                            std::set<RtEvent> &applied_events,
+                            PhysicalTraceInfo &trace_info);
       // This is a fused version of the above two methods
       virtual ApEvent add_user_fused(const RegionUsage &user,ApEvent term_event,
                                    const FieldMask &user_mask, 
@@ -823,6 +858,7 @@ namespace Legion {
                                    VersionTracker *version_tracker,
                                    const AddressSpaceID source,
                                    std::set<RtEvent> &applied_events,
+                                   PhysicalTraceInfo &trace_info,
                                    bool update_versions = true);
       virtual void add_initial_user(ApEvent term_event,
                                     const RegionUsage &usage,
@@ -854,6 +890,7 @@ namespace Legion {
       virtual void notify_valid(ReferenceMutator *mutator);
       virtual void notify_invalid(ReferenceMutator *mutator);
       virtual void collect_users(const std::set<ApEvent> &term_events);
+      virtual void update_gc_events(const std::set<ApEvent> &term_events);
     public:
       virtual void send_view(AddressSpaceID target); 
     protected:
@@ -912,7 +949,7 @@ namespace Legion {
       // Deferred views never have managers
       virtual bool has_manager(void) const { return false; }
       virtual PhysicalManager* get_manager(void) const
-      { return NULL; }
+        { return NULL; }
       virtual bool has_parent(void) const = 0;
       virtual LogicalView* get_parent(void) const = 0;
       virtual LogicalView* get_subview(const LegionColor c) = 0;
@@ -925,9 +962,15 @@ namespace Legion {
       virtual void notify_invalid(ReferenceMutator *mutator) = 0;
     public:
       virtual void send_view(AddressSpaceID target) = 0; 
+      // Should never be called directly
+      virtual InnerContext* get_context(void) const
+        { assert(false); return NULL; }
     public:
-      // Should never be called
+      // Should never be called directly
       virtual void collect_users(const std::set<ApEvent> &term_events)
+        { assert(false); }
+      // Should never be called
+      virtual void update_gc_events(const std::set<ApEvent> &term_events)
         { assert(false); }
     public:
       void issue_deferred_copies_across(const TraversalInfo &info,
@@ -935,20 +978,23 @@ namespace Legion {
                                   const std::vector<unsigned> &src_indexes,
                                   const std::vector<unsigned> &dst_indexes,
                                         ApEvent precondition, PredEvent guard,
-                                        std::set<ApEvent> &postconditions);
+                                        std::set<ApEvent> &postconditions,
+                                        PhysicalTraceInfo &trace_info);
     public:
       virtual void issue_deferred_copies(const TraversalInfo &info,
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                                          const RestrictInfo &restrict_info,
-                                         bool restrict_out) = 0;
+                                         bool restrict_out,
+                                         PhysicalTraceInfo &trace_info) = 0;
       virtual void issue_deferred_copies(const TraversalInfo &info,
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                     const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                           LegionMap<ApEvent,FieldMask>::aligned &postconditions,
                                          PredEvent pred_guard,
-                                         CopyAcrossHelper *helper = NULL) = 0; 
+                                         PhysicalTraceInfo &trace_info,
+                                         CopyAcrossHelper *helper = NULL) = 0;
     };
 
     /**
@@ -997,40 +1043,47 @@ namespace Legion {
             const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postreductions,
-                  PredEvent pred_guard, CopyAcrossHelper *helper) const;
+                  PredEvent pred_guard, PhysicalTraceInfo &trace_info,
+                  CopyAcrossHelper *helper) const;
       void copy_to_temporary(const TraversalInfo &traversal_info,
                         MaterializedView *dst, const FieldMask &copy_mask,
                         VersionTracker *src_version_tracker,
             const LegionMap<ApEvent,FieldMask>::aligned &dst_preconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postconditions,
                   PredEvent pred_guard, AddressSpaceID local_space, 
-                  bool restrict_out);
+                  bool restrict_out, PhysicalTraceInfo &trace_info);
     protected:
       void issue_nested_copies(const TraversalInfo &traversal_info,
                         MaterializedView *dst, const FieldMask &copy_mask,
                         VersionTracker *src_version_tracker,
             const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postconditions,
-                  PredEvent pred_guard, CopyAcrossHelper *helper) const;
+                  PredEvent pred_guard, PhysicalTraceInfo &trace_info,
+                  CopyAcrossHelper *helper) const;
       void issue_local_copies(const TraversalInfo &traversal_info,
                         MaterializedView *dst, FieldMask copy_mask,
                         VersionTracker *src_version_tracker,
             const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postconditions,
-                  PredEvent pred_guard, CopyAcrossHelper *helper) const;
+                  PredEvent pred_guard, PhysicalTraceInfo &trace_info,
+                  CopyAcrossHelper *helper) const;
       void issue_child_copies(const TraversalInfo &traversal_info,
                         MaterializedView *dst, const FieldMask &copy_mask,
                         VersionTracker *src_version_tracker,
             const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postreductions,
-                  PredEvent pred_guard, CopyAcrossHelper *helper) const;
+                  PredEvent pred_guard, PhysicalTraceInfo &trace_info,
+                  CopyAcrossHelper *helper) const;
       void issue_reductions(const TraversalInfo &traversal_info,
                         MaterializedView *dst, const FieldMask &copy_mask,
                         VersionTracker *src_version_tracker,
             const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                   LegionMap<ApEvent,FieldMask>::aligned &postreductions,
-                  PredEvent pred_guard, CopyAcrossHelper *helper) const;
+                  PredEvent pred_guard, PhysicalTraceInfo &trace_info,
+                  CopyAcrossHelper *helper) const;
+    public:
+      bool empty();
     public:
       RegionTreeNode *const logical_node;
       // Only valid at roots of copy trees
@@ -1093,7 +1146,7 @@ namespace Legion {
      */
     class CompositeBase {
     public:
-      CompositeBase(Reservation &base_lock);
+      CompositeBase(LocalLock &base_lock);
       virtual ~CompositeBase(void);
     protected:
       CompositeCopyNode* construct_copy_tree(MaterializedView *dst,
@@ -1120,9 +1173,14 @@ namespace Legion {
                   LegionMap<LogicalView*,FieldMask>::aligned &valid_views,
                                     bool needs_lock = true) = 0;
     public:
+      virtual void print_view_state(const FieldMask &capture_mask,
+                                    TreeStateLogger* logger,
+                                    int current_nesting,
+                                    int max_nesting);
+    public:
       CompositeNode* find_child_node(RegionTreeNode *child);
     private:
-      Reservation &base_lock;
+      LocalLock &base_lock;
     protected:
       FieldMask dirty_mask, reduction_mask;
       LegionMap<CompositeNode*,FieldMask>::aligned children;
@@ -1190,6 +1248,8 @@ namespace Legion {
       virtual void notify_invalid(ReferenceMutator *mutator);
     public:
       virtual void send_view(AddressSpaceID target); 
+      virtual InnerContext* get_context(void) const
+        { return owner_context; }
     public:
       void prune(ClosedNode *closed_tree, FieldMask &valid_mask,
                  LegionMap<CompositeView*,FieldMask>::aligned &replacements,
@@ -1198,13 +1258,15 @@ namespace Legion {
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                                          const RestrictInfo &restrict_info,
-                                         bool restrict_out);
+                                         bool restrict_out,
+                                         PhysicalTraceInfo &trace_info);
       virtual void issue_deferred_copies(const TraversalInfo &info,
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                     const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                           LegionMap<ApEvent,FieldMask>::aligned &postconditions,
                                          PredEvent pred_guard,
+                                         PhysicalTraceInfo &trace_info,
                                          CopyAcrossHelper *helper = NULL);
     public:
       // From VersionTracker
@@ -1248,6 +1310,13 @@ namespace Legion {
       RtEvent defer_add_reference(DistributedCollectable *dc, 
                                   RtEvent precondition) const;
       static void handle_deferred_view_ref(const void *args);
+    public:
+      virtual void print_view_state(const FieldMask &capture_mask,
+                                    TreeStateLogger* logger,
+                                    int current_nesting,
+                                    int max_nesting);
+    public:
+      bool has_nested_views() { return nested_composite_views.size() > 0; }
     public:
       // The path version info for this composite instance
       DeferredVersionInfo *const version_info;
@@ -1334,7 +1403,7 @@ namespace Legion {
       CompositeBase *const parent;
       const DistributedID owner_did;
     protected:
-      Reservation node_lock;
+      mutable LocalLock node_lock;
       // No need to hold references in general, but we do have to hold
       // them if we are the root child of a composite view subtree
       LegionMap<VersionState*,FieldMask>::aligned version_states;
@@ -1405,13 +1474,15 @@ namespace Legion {
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                                          const RestrictInfo &restrict_info,
-                                         bool restrict_out);
+                                         bool restrict_out,
+                                         PhysicalTraceInfo &trace_info);
       virtual void issue_deferred_copies(const TraversalInfo &info,
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                     const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                           LegionMap<ApEvent,FieldMask>::aligned &postconditions,
                                          PredEvent pred_guard,
+                                         PhysicalTraceInfo &trace_info,
                                          CopyAcrossHelper *helper = NULL);
     public:
       static void handle_send_fill_view(Runtime *runtime, Deserializer &derez,
@@ -1462,7 +1533,8 @@ namespace Legion {
               AddressSpaceID owner_proc,
               DeferredVersionInfo *version_info,
               RegionTreeNode *node, PredEvent true_guard,
-              PredEvent false_guard, bool register_now);
+              PredEvent false_guard, InnerContext *owner,
+              bool register_now);
       PhiView(const PhiView &rhs);
       virtual ~PhiView(void);
     public:
@@ -1479,6 +1551,8 @@ namespace Legion {
       virtual void notify_invalid(ReferenceMutator *mutator);
     public:
       virtual void send_view(AddressSpaceID target);
+      virtual InnerContext* get_context(void) const
+        { return owner_context; }
     public:
       virtual bool is_upper_bound_node(RegionTreeNode *node) const;
       virtual void get_field_versions(RegionTreeNode *node, bool split_prev, 
@@ -1495,13 +1569,15 @@ namespace Legion {
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                                          const RestrictInfo &restrict_info,
-                                         bool restrict_out);
+                                         bool restrict_out,
+                                         PhysicalTraceInfo &trace_info);
       virtual void issue_deferred_copies(const TraversalInfo &info,
                                          MaterializedView *dst,
                                          FieldMask copy_mask,
                     const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                           LegionMap<ApEvent,FieldMask>::aligned &postconditions,
                                          PredEvent pred_guard,
+                                         PhysicalTraceInfo &trace_info,
                                          CopyAcrossHelper *helper = NULL);
     protected:
       void issue_guarded_update_copies(const TraversalInfo &info,
@@ -1513,6 +1589,7 @@ namespace Legion {
                                        bool restrict_out,
                   const LegionMap<ApEvent,FieldMask>::aligned &preconditions,
                         LegionMap<ApEvent,FieldMask>::aligned &postconditions,
+                                       PhysicalTraceInfo &trace_info,
                                        CopyAcrossHelper *helper = NULL);
     public:
       void record_true_view(LogicalView *view, const FieldMask &view_mask);
@@ -1530,6 +1607,7 @@ namespace Legion {
       const PredEvent true_guard;
       const PredEvent false_guard;
       DeferredVersionInfo *const version_info;
+      InnerContext *const owner_context;
     protected:
       LegionMap<LogicalView*,FieldMask>::aligned true_views;
       LegionMap<LogicalView*,FieldMask>::aligned false_views;

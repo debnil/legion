@@ -46,7 +46,7 @@ namespace Legion {
       ResourceTracker& operator=(const ResourceTracker &rhs);
     public:
       virtual void register_region_creations(
-                          const std::set<LogicalRegion> &regions) = 0;
+                     const std::map<LogicalRegion,bool> &regions) = 0;
       virtual void register_region_deletions(
                           const std::set<LogicalRegion> &regions) = 0;
     public:
@@ -76,7 +76,8 @@ namespace Legion {
       static void unpack_privilege_state(Deserializer &derez,
                                          ResourceTracker *target);
     protected:
-      std::set<LogicalRegion>                   created_regions;
+      std::map<LogicalRegion,
+               bool/*local*/>                   created_regions;
       std::map<std::pair<FieldSpace,FieldID>,
                bool/*local*/>                   created_fields;
       std::set<FieldSpace>                      created_field_spaces;
@@ -131,7 +132,7 @@ namespace Legion {
      * This is the base task operation class for all
      * kinds of tasks in the system.  
      */
-    class TaskOp : public ExternalTask, public SpeculativeOp {
+    class TaskOp : public ExternalTask, public MemoizableOp<SpeculativeOp> {
     public:
       enum TaskKind {
         INDIVIDUAL_TASK_KIND,
@@ -140,24 +141,83 @@ namespace Legion {
         SLICE_TASK_KIND,
       };
     public:
+      struct TriggerTaskArgs : public LgTaskArgs<TriggerTaskArgs> {
+      public:
+        static const LgTaskID TASK_ID = LG_TRIGGER_TASK_ID;
+      public:
+        TriggerTaskArgs(TaskOp *t)
+          : LgTaskArgs<TriggerTaskArgs>(t->get_unique_op_id()), op(t) { }
+      public:
+        TaskOp *const op;
+      };
       struct DeferDistributeArgs : public LgTaskArgs<DeferDistributeArgs> {
       public:
         static const LgTaskID TASK_ID = LG_DEFER_DISTRIBUTE_TASK_ID;
       public:
-        TaskOp *proxy_this;
+        DeferDistributeArgs(TaskOp *op)
+          : LgTaskArgs<DeferDistributeArgs>(op->get_unique_op_id()),
+            proxy_this(op) { }
+      public:
+        TaskOp *const proxy_this;
       };
       struct DeferMappingArgs : public LgTaskArgs<DeferMappingArgs> {
       public:
         static const LgTaskID TASK_ID = LG_DEFER_PERFORM_MAPPING_TASK_ID;
       public:
-        TaskOp *proxy_this;
-        MustEpochOp *must_op;
+        DeferMappingArgs(TaskOp *op, MustEpochOp *owner)
+          : LgTaskArgs<DeferMappingArgs>(op->get_unique_op_id()),
+            proxy_this(op), must_op(owner) { }
+      public:
+        TaskOp *const proxy_this;
+        MustEpochOp *const must_op;
       };
       struct DeferLaunchArgs : public LgTaskArgs<DeferLaunchArgs> {
       public:
         static const LgTaskID TASK_ID = LG_DEFER_LAUNCH_TASK_ID;
       public:
-        TaskOp *proxy_this;
+        DeferLaunchArgs(TaskOp *op)
+          : LgTaskArgs<DeferLaunchArgs>(op->get_unique_op_id()), 
+            proxy_this(op) { }
+      public:
+        TaskOp *const proxy_this;
+      };
+      struct DeferredFutureSetArgs : public LgTaskArgs<DeferredFutureSetArgs> {
+      public:
+        static const LgTaskID TASK_ID = LG_DEFERRED_FUTURE_SET_ID;
+      public:
+        DeferredFutureSetArgs(FutureImpl *tar, FutureImpl *res, TaskOp *t)
+          : LgTaskArgs<DeferredFutureSetArgs>(t->get_unique_op_id()),
+            target(tar), result(res), task_op(t) { }
+      public:
+        FutureImpl *const target;
+        FutureImpl *const result;
+        TaskOp *const task_op;
+      };
+      struct DeferredFutureMapSetArgs : 
+        public LgTaskArgs<DeferredFutureMapSetArgs> {
+      public:
+        static const LgTaskID TASK_ID = LG_DEFERRED_FUTURE_MAP_SET_ID;
+      public:
+        DeferredFutureMapSetArgs(FutureMapImpl *map, FutureImpl *res,
+                                 Domain d, TaskOp *t)
+          : LgTaskArgs<DeferredFutureMapSetArgs>(t->get_unique_op_id()),
+            future_map(map), result(res), domain(d), task_op(t) { }
+      public:
+        FutureMapImpl *const future_map;
+        FutureImpl *const result;
+        const Domain domain;
+        TaskOp *const task_op;
+      };
+      struct DeferredEnqueueArgs : public LgTaskArgs<DeferredEnqueueArgs> {
+      public:
+        static const LgTaskID TASK_ID = LG_DEFERRED_ENQUEUE_TASK_ID;
+      public:
+        DeferredEnqueueArgs(ProcessorManager *man, TaskOp *t)
+          : LgTaskArgs<DeferredEnqueueArgs>(t->get_unique_op_id()),
+            manager(man), task(t) { }
+      public:
+        ProcessorManager *const manager;
+        TaskOp *const task;
       };
     public:
       TaskOp(Runtime *rt);
@@ -320,6 +380,7 @@ namespace Legion {
       bool commit_received;
     protected:
       bool options_selected;
+      bool memoize_selected;
       bool map_origin;
     protected:
       // For managing predication
@@ -363,14 +424,22 @@ namespace Legion {
       public:
         static const LgTaskID TASK_ID = LG_DEFERRED_POST_MAPPED_ID;
       public:
-        SingleTask *task;
+        DeferredPostMappedArgs(SingleTask *t)
+          : LgTaskArgs<DeferredPostMappedArgs>(t->get_unique_op_id()),
+            task(t) { }
+      public:
+        SingleTask *const task;
       };
       struct MisspeculationTaskArgs :
         public LgTaskArgs<MisspeculationTaskArgs> {
       public:
         static const LgTaskID TASK_ID = LG_MISSPECULATE_TASK_ID;
       public:
-        SingleTask *task;
+        MisspeculationTaskArgs(SingleTask *t)
+          : LgTaskArgs<MisspeculationTaskArgs>(t->get_unique_op_id()),
+            task(t) { }
+      public:
+        SingleTask *const task;
       };
     public:
       SingleTask(Runtime *rt);
@@ -408,6 +477,7 @@ namespace Legion {
                                     Mapper::MapTaskOutput &output,
                                     MustEpochOp *must_epoch_owner,
                                     std::vector<InstanceSet> &valid_instances); 
+      void replay_map_task_output();
     protected: // mapper helper calls
       void validate_target_processors(const std::vector<Processor> &prcs) const;
       void validate_variant_selection(MapperManager *local_mapper,
@@ -464,6 +534,9 @@ namespace Legion {
                                  size_t res_size, bool owned) = 0; 
       virtual void handle_post_mapped(RtEvent pre = RtEvent::NO_RT_EVENT) = 0;
       virtual void handle_misspeculation(void) = 0;
+    public:
+      // From Memoizable
+      virtual void complete_replay(ApEvent completion_event);
     protected:
       // Boolean for each region saying if it is virtual mapped
       std::vector<bool> virtual_mapped;
@@ -619,7 +692,8 @@ namespace Legion {
       RtEvent perform_versioning_analysis(void);
       virtual RtEvent perform_must_epoch_version_analysis(MustEpochOp *own);
     public:
-      virtual bool has_prepipeline_stage(void) const { return true; }
+      virtual bool has_prepipeline_stage(void) const
+        { return need_prepipeline_stage; }
       virtual void trigger_prepipeline_stage(void);
       virtual void trigger_dependence_analysis(void);
       virtual void trigger_ready(void);
@@ -673,6 +747,9 @@ namespace Legion {
       void unpack_remote_mapped(Deserializer &derez);
       void unpack_remote_complete(Deserializer &derez);
       void unpack_remote_commit(Deserializer &derez);
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
     public:
       static void process_unpack_remote_mapped(Deserializer &derez);
       static void process_unpack_remote_complete(Deserializer &derez);
@@ -783,6 +860,12 @@ namespace Legion {
       void send_back_created_state(AddressSpaceID target);
     public:
       virtual void record_reference_mutation_effect(RtEvent event);
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
+    public:
+      // From Memoizable
+      virtual TraceLocalID get_trace_local_id() const;
     protected:
       friend class SliceTask;
       SliceTask                   *slice_owner;
@@ -831,7 +914,8 @@ namespace Legion {
       virtual void activate(void);
       virtual void deactivate(void);
     public:
-      virtual bool has_prepipeline_stage(void) const { return true; }
+      virtual bool has_prepipeline_stage(void) const
+        { return need_prepipeline_stage; }
       virtual void trigger_prepipeline_stage(void);
       virtual void trigger_dependence_analysis(void);
       virtual void report_interfering_requirements(unsigned idx1,unsigned idx2);
@@ -885,6 +969,9 @@ namespace Legion {
       void unpack_slice_complete(Deserializer &derez);
       void unpack_slice_commit(Deserializer &derez); 
     public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
+    public:
       static void process_slice_mapped(Deserializer &derez, 
                                        AddressSpaceID source);
       static void process_slice_complete(Deserializer &derez);
@@ -935,6 +1022,10 @@ namespace Legion {
       struct DeferMapAndLaunchArgs : public LgTaskArgs<DeferMapAndLaunchArgs> {
       public:
         static const LgTaskID TASK_ID = LG_DEFER_MAP_AND_LAUNCH_TASK_ID;
+      public:
+        DeferMapAndLaunchArgs(SliceTask *t)
+          : LgTaskArgs<DeferMapAndLaunchArgs>(t->get_unique_op_id()),
+            proxy_this(t) { }
       public:
         SliceTask *proxy_this;
       };
@@ -1010,7 +1101,7 @@ namespace Legion {
       static void handle_slice_return(Runtime *rt, Deserializer &derez);
     public: // Privilege tracker methods
       virtual void register_region_creations(
-                          const std::set<LogicalRegion> &regions);
+                     const std::map<LogicalRegion,bool> &regions);
       virtual void register_region_deletions(
                           const std::set<LogicalRegion> &regions);
     public:
@@ -1033,6 +1124,9 @@ namespace Legion {
                           const std::set<IndexPartition> &parts);
       virtual void register_index_partition_deletions(
                           const std::set<IndexPartition> &parts);
+    public:
+      // From MemoizableOp
+      virtual void replay_analysis(void);
     protected:
       friend class IndexTask;
       friend class PointTask;

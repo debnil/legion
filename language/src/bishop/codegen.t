@@ -515,6 +515,13 @@ function codegen.select_task_options(rules, automata, signature,
         [value.actions]
         [options_var].initial_proc = [value.value]
       end
+    elseif key == "memoize" or key == "map_locally" then
+      local value = codegen.expr(binders, state_var, value_ast)
+      body = quote
+        [body]
+        [value.actions]
+        [options_var].[key]= [value.value]
+      end
     end
   end
 
@@ -526,8 +533,9 @@ function codegen.select_task_options(rules, automata, signature,
     var [state_var] = [&mapper_state_type](ptr)
     -- XXX: These should be handled in the same way as other properties
     [options_var].inline_task = false
-    [options_var].map_locally = true
+    [options_var].map_locally = false
     [options_var].stealable = false
+    [options_var].memoize = false
     [body]
   end
 end

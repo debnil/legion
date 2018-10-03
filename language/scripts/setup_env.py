@@ -21,6 +21,8 @@ import argparse, hashlib, multiprocessing, os, platform, re, subprocess, sys, tr
 def discover_llvm_version():
     if platform.node().startswith('titan'):
         return '38'
+    elif os.environ.get('LMOD_SYSTEM_NAME') == 'summit': # Summit doesn't set hostname
+        return '38'
     else:
         return '39'
 
@@ -43,8 +45,16 @@ def discover_conduit():
         return 'psm'
     elif platform.node().startswith('titan'):
         return 'gemini'
+    elif os.environ.get('LMOD_SYSTEM_NAME') == 'summit': # Summit doesn't set hostname
+        return 'ibv'
     else:
         raise Exception('Please set CONDUIT in your environment')
+
+def gasnet_enabled():
+    return 'USE_GASNET' not in os.environ or os.environ['USE_GASNET'] == '1'
+
+def hdf_enabled():
+    return 'USE_HDF' in os.environ and os.environ['USE_HDF'] == '1'
 
 def check_sha1(file_path, sha1):
     with open(file_path, 'rb') as f:
@@ -71,6 +81,9 @@ def extract(dest_dir, archive_path, format):
         subprocess.check_call(['tar', 'xfJ', archive_path], cwd=dest_dir)
     else:
         raise Exception('Unknown format %s' % format)
+
+def apply_patch(dest_dir, diff_path, strip_levels=1):
+    subprocess.check_call(['patch', '-p%d' % strip_levels, '-i', diff_path], cwd=dest_dir)
 
 def git_clone(repo_dir, url, branch=None):
     if branch is not None:
@@ -138,14 +151,35 @@ def build_terra(terra_dir, llvm_dir, cache, is_cray, thread_count):
         cwd=terra_dir,
         env=env)
 
+def build_hdf(source_dir, install_dir, thread_count, is_cray):
+    env = None
+    if is_cray:
+        env = dict(list(os.environ.items()) + [
+            ('CC', os.environ['HOST_CC']),
+            ('CXX', os.environ['HOST_CXX']),
+        ])
+    subprocess.check_call(
+        ['./configure',
+         '--prefix=%s' % install_dir,
+         '--enable-threadsafe',
+         '--disable-hl'],
+        cwd=source_dir,
+        env=env)
+    subprocess.check_call(['make', '-j', str(thread_count)], cwd=source_dir)
+    subprocess.check_call(['make', 'install'], cwd=source_dir)
+
 def build_regent(root_dir, use_cmake, cmake_exe,
-                 gasnet_dir, llvm_dir, terra_dir, conduit, thread_count):
-    env = dict(list(os.environ.items()) + [
-        ('CONDUIT', conduit),
-        ('GASNET', gasnet_dir),
-        ('USE_GASNET', os.environ['USE_GASNET'] if 'USE_GASNET' in os.environ else '1'),
-        ('LLVM_CONFIG', os.path.join(llvm_dir, 'bin', 'llvm-config')),
-    ])
+                 gasnet_dir, llvm_dir, terra_dir, hdf_dir, conduit, thread_count):
+    env = dict(list(os.environ.items()) +
+        ([('CONDUIT', conduit),
+          ('GASNET', gasnet_dir),
+          ('USE_GASNET', '1')]
+         if gasnet_enabled() else []) +
+        ([('HDF_ROOT', hdf_dir),
+          ('USE_HDF', '1')]
+         if hdf_enabled() else []) +
+        [('LLVM_CONFIG', os.path.join(llvm_dir, 'bin', 'llvm-config'))]
+    )
 
     subprocess.check_call(
         [os.path.join(root_dir, 'install.py'),
@@ -163,7 +197,14 @@ def install_llvm(llvm_dir, llvm_install_dir, llvm_version, llvm_use_cmake, cmake
         pass # Hope this means it already exists
     assert(os.path.isdir(llvm_dir))
 
-    if llvm_version == '38':
+    if llvm_version == '35':
+        llvm_tarball = os.path.join(llvm_dir, 'llvm-3.5.2.src.tar.xz')
+        llvm_source_dir = os.path.join(llvm_dir, 'llvm-3.5.2.src')
+        clang_tarball = os.path.join(llvm_dir, 'cfe-3.5.2.src.tar.xz')
+        clang_source_dir = os.path.join(llvm_dir, 'cfe-3.5.2.src')
+        download(llvm_tarball, 'http://sapling.stanford.edu/~eslaught/llvm/3.5.2/llvm-3.5.2.src.tar.xz', '85faf7cbd518dabeafc4d3f7e909338fc1dab3c4', insecure=insecure)
+        download(clang_tarball, 'http://sapling.stanford.edu/~eslaught/llvm/3.5.2/cfe-3.5.2.src.tar.xz', '50291e4c4ced8fcee3cca40bff0afb19fcc356e2', insecure=insecure)
+    elif llvm_version == '38':
         llvm_tarball = os.path.join(llvm_dir, 'llvm-3.8.1.src.tar.xz')
         llvm_source_dir = os.path.join(llvm_dir, 'llvm-3.8.1.src')
         clang_tarball = os.path.join(llvm_dir, 'cfe-3.8.1.src.tar.xz')
@@ -177,16 +218,33 @@ def install_llvm(llvm_dir, llvm_install_dir, llvm_version, llvm_use_cmake, cmake
         clang_source_dir = os.path.join(llvm_dir, 'cfe-3.9.1.src')
         download(llvm_tarball, 'http://sapling.stanford.edu/~eslaught/llvm/3.9.1/llvm-3.9.1.src.tar.xz', 'ce801cf456b8dacd565ce8df8288b4d90e7317ff', insecure=insecure)
         download(clang_tarball, 'http://sapling.stanford.edu/~eslaught/llvm/3.9.1/cfe-3.9.1.src.tar.xz', '95e4be54b70f32cf98a8de36821ea5495b84add8', insecure=insecure)
+    else:
+        assert False
 
     if not cache:
         extract(llvm_dir, llvm_tarball, 'xz')
         extract(llvm_dir, clang_tarball, 'xz')
+        if llvm_version == '35':
+            apply_patch(llvm_source_dir, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'llvm-3.5-gcc.patch'))
         os.rename(clang_source_dir, os.path.join(llvm_source_dir, 'tools', 'clang'))
 
         llvm_build_dir = os.path.join(llvm_dir, 'build')
         os.mkdir(llvm_build_dir)
         os.mkdir(llvm_install_dir)
         build_llvm(llvm_source_dir, llvm_build_dir, llvm_install_dir, llvm_use_cmake, cmake_exe, thread_count, is_cray)
+
+def install_hdf(hdf_dir, hdf_install_dir, thread_count, cache, is_cray, insecure):
+    try:
+        os.mkdir(hdf_dir)
+    except OSError:
+        pass # Hope this means it already exists
+    assert(os.path.isdir(hdf_dir))
+    hdf_tarball = os.path.join(hdf_dir, 'hdf5-1.10.1.tar.gz')
+    hdf_source_dir = os.path.join(hdf_dir, 'hdf5-1.10.1')
+    download(hdf_tarball, 'http://sapling.stanford.edu/~manolis/hdf/hdf5-1.10.1.tar.gz', '73b77a23ca099ac47d8241f633bf67430007c430', insecure=insecure)
+    if not cache:
+        extract(hdf_dir, hdf_tarball, 'gz')
+        build_hdf(hdf_source_dir, hdf_install_dir, thread_count, is_cray)
 
 def print_advice(component_dir):
     print('Given the number of things that could potentially have gone')
@@ -258,7 +316,9 @@ def driver(prefix_dir=None, cache=False, legion_use_cmake=False, llvm_version=No
         if 'HOST_CXX' not in os.environ:
             raise Exception('Please set HOST_CXX in your environment')
 
-    if llvm_version == '38':
+    if llvm_version == '35':
+        llvm_use_cmake = False
+    elif llvm_version == '38':
         llvm_use_cmake = False
     elif llvm_version == '39':
         llvm_use_cmake = True
@@ -275,24 +335,26 @@ def driver(prefix_dir=None, cache=False, legion_use_cmake=False, llvm_version=No
 
     thread_count = multiprocessing.cpu_count()
 
-    conduit = discover_conduit()
-    gasnet_dir = os.path.realpath(os.path.join(prefix_dir, 'gasnet'))
-    gasnet_release_dir = os.path.join(gasnet_dir, 'release')
-    gasnet_build_result = os.path.join(
-        gasnet_release_dir, '%s-conduit' % conduit,
-        'libgasnet-%s-par.a' % conduit)
-    if not os.path.exists(gasnet_dir):
-        git_clone(gasnet_dir, 'https://github.com/StanfordLegion/gasnet.git')
-    if not os.path.exists(gasnet_release_dir):
+    gasnet_release_dir = None
+    conduit = None
+    if gasnet_enabled():
+        gasnet_dir = os.path.realpath(os.path.join(prefix_dir, 'gasnet'))
+        if not os.path.exists(gasnet_dir):
+            git_clone(gasnet_dir, 'https://github.com/StanfordLegion/gasnet.git')
         if not cache:
-            try:
-                build_gasnet(gasnet_dir, conduit)
-            except Exception as e:
-                report_build_failure('gasnet', gasnet_dir, e)
-    else:
-        check_dirty_build('gasnet', gasnet_build_result, gasnet_dir)
-    if not cache:
-        assert os.path.exists(gasnet_build_result)
+            conduit = discover_conduit()
+            gasnet_release_dir = os.path.join(gasnet_dir, 'release')
+            gasnet_build_result = os.path.join(
+                gasnet_release_dir, '%s-conduit' % conduit,
+                'libgasnet-%s-par.a' % conduit)
+            if not os.path.exists(gasnet_release_dir):
+                try:
+                    build_gasnet(gasnet_dir, conduit)
+                except Exception as e:
+                    report_build_failure('gasnet', gasnet_dir, e)
+            else:
+                check_dirty_build('gasnet', gasnet_build_result, gasnet_dir)
+            assert os.path.exists(gasnet_build_result)
 
     cmake_exe = None
     try:
@@ -351,9 +413,24 @@ def driver(prefix_dir=None, cache=False, legion_use_cmake=False, llvm_version=No
     if not cache:
         assert os.path.exists(terra_build_result)
 
+    hdf_install_dir = None
+    if hdf_enabled():
+        hdf_dir = os.path.join(prefix_dir, 'hdf')
+        hdf_install_dir = os.path.join(hdf_dir, 'install')
+        hdf_build_result = os.path.join(hdf_install_dir, 'lib', 'libhdf5.so')
+        if not os.path.exists(hdf_install_dir):
+            try:
+                install_hdf(hdf_dir, hdf_install_dir, thread_count, cache, is_cray, insecure)
+            except Exception as e:
+                report_build_failure('hdf', hdf_dir, e)
+        else:
+            check_dirty_build('hdf', hdf_build_result, hdf_dir)
+        if not cache:
+            assert os.path.exists(hdf_build_result)
+
     if not cache:
         build_regent(root_dir, legion_use_cmake, cmake_exe,
-                     gasnet_release_dir, llvm_install_dir, terra_dir,
+                     gasnet_release_dir, llvm_install_dir, terra_dir, hdf_install_dir,
                      conduit, thread_count)
 
 if __name__ == '__main__':
@@ -374,7 +451,7 @@ if __name__ == '__main__':
         default=os.environ.get('USE_CMAKE') == 1,
         help='Use CMake to build Legion.')
     parser.add_argument(
-        '--llvm-version', dest='llvm_version', required=False, choices=('38', '39'),
+        '--llvm-version', dest='llvm_version', required=False, choices=('35', '38', '39'),
         default=discover_llvm_version(),
         help='Select LLVM version.')
     parser.add_argument(

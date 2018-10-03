@@ -756,8 +756,6 @@ namespace Legion {
 #ifdef DEBUG_LEGION
       assert(target_proc.exists());
 #endif
-      profiler_lock = Reservation::create_reservation();
-
       if (!strcmp(serializer_type, "binary")) 
       {
         if (prof_logfile == NULL) 
@@ -778,9 +776,8 @@ namespace Legion {
         else
         {
           // replace % with node number
-          Processor current = Processor::get_executing_processor();
           std::stringstream ss;
-          ss << filename.substr(0, pct) << current.address_space() <<
+          ss << filename.substr(0, pct) << target.address_space() <<
                 filename.substr(pct + 1);
           serializer = new LegionProfBinarySerializer(ss.str());
         }
@@ -856,8 +853,6 @@ namespace Legion {
     LegionProfiler::~LegionProfiler(void)
     //--------------------------------------------------------------------------
     {
-      profiler_lock.destroy_reservation();
-      profiler_lock = Reservation::NO_RESERVATION;
       for (std::vector<LegionProfInstance*>::const_iterator it = 
             instances.begin(); it != instances.end(); it++)
         delete (*it);
@@ -1404,7 +1399,7 @@ namespace Legion {
       decrement_total_outstanding_requests();
 #endif
       if (!done_event.has_triggered())
-        done_event.lg_wait();
+        done_event.wait();
       for (std::vector<LegionProfInstance*>::const_iterator it = 
             instances.begin(); it != instances.end(); it++) {
         (*it)->dump_state(serializer);

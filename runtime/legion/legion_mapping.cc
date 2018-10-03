@@ -174,10 +174,19 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    bool PhysicalInstance::is_external_instance(void) const
+    //--------------------------------------------------------------------------
+    {
+      if (impl == NULL)
+        return false;
+      return impl->is_external_instance();
+    }
+
+    //--------------------------------------------------------------------------
     /*static*/ PhysicalInstance PhysicalInstance::get_virtual_instance(void)
     //--------------------------------------------------------------------------
     {
-      return PhysicalInstance(Internal::VirtualManager::get_virtual_instance());
+      return PhysicalInstance(Internal::implicit_runtime->virtual_manager);
     }
 
     //--------------------------------------------------------------------------
@@ -349,6 +358,22 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
+    void MapperRuntime::update_mappable_tag(MapperContext ctx,
+                               const Mappable &mappable, MappingTagID tag) const
+    //--------------------------------------------------------------------------
+    {
+      ctx->manager->update_mappable_tag(ctx, mappable, tag);
+    }
+
+    //--------------------------------------------------------------------------
+    void MapperRuntime::update_mappable_data(MapperContext ctx,
+      const Mappable &mappable, const void *mapper_data, size_t data_size) const
+    //--------------------------------------------------------------------------
+    {
+      ctx->manager->update_mappable_data(ctx, mappable, mapper_data, data_size);
+    }
+
+    //--------------------------------------------------------------------------
     void MapperRuntime::send_message(MapperContext ctx, Processor target,
           const void *message, size_t message_size, unsigned message_kind) const
     //--------------------------------------------------------------------------
@@ -367,7 +392,7 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     void MapperRuntime::pack_physical_instance(MapperContext ctx, 
-                               Serializer &rez, PhysicalInstance instance) const 
+                               Serializer &rez, PhysicalInstance instance) const
     //--------------------------------------------------------------------------
     {
       ctx->manager->pack_physical_instance(ctx, rez, instance);
@@ -912,6 +937,14 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       return ctx->manager->get_index_space_color(ctx, handle);
+    }
+
+    //--------------------------------------------------------------------------
+    DomainPoint MapperRuntime::get_index_space_color_point(MapperContext ctx, 
+                                                        IndexSpace handle) const
+    //--------------------------------------------------------------------------
+    {
+      return ctx->manager->get_index_space_color_point(ctx, handle);
     }
 
     //--------------------------------------------------------------------------

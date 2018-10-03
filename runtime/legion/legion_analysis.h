@@ -374,16 +374,16 @@ namespace Legion {
     };
 
     /**
-     * \struct TracingInfo
+     * \struct LogicalTraceInfo
      * Information about tracing needed for logical
      * dependence analysis.
      */
-    struct TraceInfo {
+    struct LogicalTraceInfo {
     public:
-      TraceInfo(bool already_tr,
-                LegionTrace *tr,
-                unsigned idx,
-                const RegionRequirement &r);
+      LogicalTraceInfo(bool already_tr,
+                       LegionTrace *tr,
+                       unsigned idx,
+                       const RegionRequirement &r);
     public:
       bool already_traced;
       LegionTrace *trace;
@@ -468,6 +468,18 @@ namespace Legion {
     }; 
 
     /**
+     * \struct PhysicalTraceInfo
+     */
+    struct PhysicalTraceInfo {
+    public:
+      PhysicalTraceInfo();
+    public:
+      bool recording;
+      Operation *op;
+      PhysicalTemplate *tpl;
+    };
+
+    /**
      * \struct TraversalInfo
      */
     struct TraversalInfo {
@@ -485,6 +497,7 @@ namespace Legion {
       const FieldMask traversal_mask;
       const UniqueID context_uid;
       std::set<RtEvent> &map_applied_events;
+      ContextID logical_ctx;
     };
 
     /**
@@ -540,7 +553,11 @@ namespace Legion {
       bool projection_domain_dominates(IndexSpaceNode *next_space) const;
     public:
       void print_state(TreeStateLogger *logger, 
-                       const FieldMask &capture_mask) const;
+                       const FieldMask &capture_mask,
+                       RegionNode *node) const;
+      void print_state(TreeStateLogger *logger, 
+                       const FieldMask &capture_mask,
+                       PartitionNode *node) const;
     public:
       OpenState open_state;
       ReductionOpID redop;
@@ -677,6 +694,14 @@ namespace Legion {
       static ClosedNode* unpack_closed_node(Deserializer &derez, 
                                             Runtime *runtime, bool is_region);
     public:
+      void record_closed_tree(
+          const FieldMask &fields, ContextID logical_ctx,
+          LegionMap<std::pair<RegionTreeNode*,ContextID>,
+                    FieldMask>::aligned &closed_nodes,
+          std::map<std::pair<RegionTreeNode*,ContextID>,
+                   LegionMap<IndexSpaceNode*,FieldMask>::aligned>
+                   &closed_projections);
+    public:
       RegionTreeNode *const node;
     protected:
       FieldMask valid_fields; // Fields that are summarized in this tree
@@ -720,7 +745,7 @@ namespace Legion {
       void initialize_close_operations(LogicalState &state, 
                                        Operation *creator,
                                        const VersionInfo &version_info,
-                                       const TraceInfo &trace_info);
+                                       const LogicalTraceInfo &trace_info);
       void perform_dependence_analysis(const LogicalUser &current,
                                        const FieldMask &open_below,
              LegionList<LogicalUser,CURR_LOGICAL_ALLOC>::track_aligned &cusers,
@@ -825,7 +850,6 @@ namespace Legion {
                     std::set<RtEvent> &ready_events) const;
     public:
       void print_physical_state(const FieldMask &capture_mask,
-          LegionMap<LegionColor,FieldMask>::aligned &to_traverse,
                                 TreeStateLogger *logger);
     public:
       RegionTreeNode *const node;
@@ -972,8 +996,9 @@ namespace Legion {
     public:
       void print_physical_state(RegionTreeNode *node,
                                 const FieldMask &capture_mask,
-                         LegionMap<LegionColor,FieldMask>::aligned &to_traverse,
                                 TreeStateLogger *logger);
+    public:
+      void update_physical_state(PhysicalState *state);
     protected:
       VersionState* create_new_version_state(VersionID vid);
     public:
@@ -1037,7 +1062,7 @@ namespace Legion {
       const unsigned depth;
       Runtime *const runtime;
     protected:
-      Reservation manager_lock;
+      mutable LocalLock manager_lock;
     protected:
       InnerContext *current_context;
     protected:
@@ -1110,7 +1135,6 @@ namespace Legion {
         VersionState *proxy_this;
         LegionColor child_color;
         VersioningSet<> *children;
-        Reservation state_lock;
       };
       struct ConvertViewArgs : public LgTaskArgs<ConvertViewArgs> {
       public:
@@ -1267,7 +1291,7 @@ namespace Legion {
       const VersionID version_number;
       RegionTreeNode *const logical_node;
     protected:
-      Reservation state_lock;
+      mutable LocalLock state_lock;
       // Fields which have been directly written to
       FieldMask dirty_mask;
       // Fields which have reductions
@@ -1540,9 +1564,8 @@ namespace Legion {
         LegionRuntime::Accessor::AccessorType::Generic>
           get_field_accessor(FieldID fid) const;
     public:
-      void pack_reference(Serializer &rez, AddressSpaceID target);
-      void unpack_reference(Runtime *rt, TaskOp *task,
-                            Deserializer &derez, RtEvent &ready);
+      void pack_reference(Serializer &rez) const;
+      void unpack_reference(Runtime *rt, Deserializer &derez, RtEvent &ready);
     protected:
       FieldMask valid_fields; 
       ApEvent ready_event;
@@ -1604,9 +1627,9 @@ namespace Legion {
       void add_instance(const InstanceRef &ref);
       bool is_virtual_mapping(void) const;
     public:
-      void pack_references(Serializer &rez, AddressSpaceID target) const;
-      void unpack_references(Runtime *runtime, TaskOp *task,
-          Deserializer &derez, std::set<RtEvent> &ready_events);
+      void pack_references(Serializer &rez) const;
+      void unpack_references(Runtime *runtime, Deserializer &derez, 
+                             std::set<RtEvent> &ready_events);
     public:
       void add_valid_references(ReferenceSource source) const;
       void remove_valid_references(ReferenceSource source) const;

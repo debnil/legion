@@ -94,7 +94,7 @@ endif
 ifeq ($(findstring daint,$(shell uname -n)),daint)
 CUDA=${CUDATOOLKIT_HOME}
 CONDUIT=aries
-GPU_ARCH=k20
+GPU_ARCH=pascal
 endif
 ifeq ($(findstring excalibur,$(shell uname -n)),excalibur)
 CONDUIT=aries
@@ -123,9 +123,9 @@ endif
 MARCH ?= native
 
 ifneq (${MARCH},)
-  # Summitdev is strange and wants to have this specified via -mcpu
+  # Summit/Summitdev are strange and want to have this specified via -mcpu
   # instead of -march. Unclear if this is true in general for PPC.
-  ifeq ($(findstring summitdev,$(shell uname -n)),summitdev)
+  ifeq ($(findstring ppc64le,$(shell uname -p)),ppc64le)
     CC_FLAGS += -mcpu=${MARCH} -maltivec -mabi=altivec -mvsx
   else
     CC_FLAGS += -march=${MARCH}
@@ -320,6 +320,10 @@ ifeq ($(strip $(GPU_ARCH)),k20)
 NVCC_FLAGS	+= -arch=compute_35 -code=sm_35
 NVCC_FLAGS	+= -DK20_ARCH
 endif
+ifeq ($(strip $(GPU_ARCH)),k80)
+NVCC_FLAGS	+= -arch=compute_37 -code=sm_37
+NVCC_FLAGS	+= -DK80_ARCH
+endif
 ifeq ($(strip $(GPU_ARCH)),maxwell)
 NVCC_FLAGS	+= -arch=compute_52 -code=sm_52
 NVCC_FLAGS	+= -DMAXWELL_ARCH
@@ -422,8 +426,9 @@ ifeq ($(strip $(USE_MPI)),1)
     CC		:= mpicc
     CXX		:= mpicxx
     F90         := mpif90
-    # Summitdev is strange and links this automatically (but still uses mpicxx).
-    ifneq ($(findstring summitdev,$(shell uname -n)),summitdev)
+    # Summit/Summitdev are strange and link this automatically (but still uses mpicxx).
+    # FIXME: Unfortunately you can't match against the Summit hostname right now...
+    ifneq ($(findstring ppc64le,$(shell uname -p)),ppc64le)
       LEGION_LD_FLAGS	+= -L$(MPI)/lib -lmpi
     endif
     LAPACK_LIBS ?= -lblas
@@ -441,7 +446,7 @@ endif
 
 
 ifeq ($(strip $(DEBUG)),1)
-CC_FLAGS	+= -DDEBUG_REALM -DDEBUG_LEGION -ggdb #-ggdb -Wall
+CC_FLAGS	+= -DDEBUG_REALM -DDEBUG_LEGION -O0 -ggdb #-ggdb -Wall
 else
 CC_FLAGS	+= -O2 -fno-strict-aliasing #-ggdb
 endif
@@ -625,6 +630,9 @@ $(GEN_GPU_OBJS) : %.cu.o : %.cu
 
 $(GPU_RUNTIME_OBJS): %.cu.o : %.cu
 	$(NVCC) -o $@ -c $< $(NVCC_FLAGS) $(INC_FLAGS)
+
+# disable gmake's default rule for building % from %.o
+% : %.o
 
 clean::
 	$(RM) -f $(OUTFILE) $(SLIB_LEGION) $(SLIB_REALM) $(GEN_OBJS) $(GEN_GPU_OBJS) $(REALM_OBJS) $(LEGION_OBJS) $(GPU_RUNTIME_OBJS) $(MAPPER_OBJS) $(ASM_OBJS)

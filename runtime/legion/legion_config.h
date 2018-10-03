@@ -105,11 +105,20 @@
 // Default amount of hysteresis on the task window in the
 // form of a percentage (must be between 0 and 100)
 #ifndef DEFAULT_TASK_WINDOW_HYSTERESIS
-#define DEFAULT_TASK_WINDOW_HYSTERESIS  75
+#define DEFAULT_TASK_WINDOW_HYSTERESIS  25
 #endif
-// How many tasks to group together for runtime operations
+// Default number of tasks to have in flight before applying 
+// back pressure to the mapping process for a context
 #ifndef DEFAULT_MIN_TASKS_TO_SCHEDULE
 #define DEFAULT_MIN_TASKS_TO_SCHEDULE   32
+#endif
+// How many tasks to group together for runtime operations
+#ifndef DEFAULT_META_TASK_VECTOR_WIDTH
+#define DEFAULT_META_TASK_VECTOR_WIDTH  16
+#endif
+// Default number of replay tasks to run in parallel
+#ifndef DEFAULT_MAX_REPLAY_PARALLELISM
+#define DEFAULT_MAX_REPLAY_PARALLELISM  2
 #endif
 // The maximum size of active messages sent by the runtime in bytes
 // Note this value was picked based on making a tradeoff between
@@ -177,6 +186,17 @@
 // Maximum depth of composite instances before warnings
 #ifndef LEGION_PRUNE_DEPTH_WARNING
 #define LEGION_PRUNE_DEPTH_WARNING        8
+#endif
+
+// Maximum number of non-replayable templates before warnings
+#ifndef LEGION_NON_REPLAYABLE_WARNING
+#define LEGION_NON_REPLAYABLE_WARNING     5
+#endif
+
+// Initial offset for library IDs
+// Controls how many IDs are available for dynamic use
+#ifndef LEGION_INITIAL_LIBRARY_ID_OFFSET
+#define LEGION_INITIAL_LIBRARY_ID_OFFSET (1 << 30)
 #endif
 
 // Some helper macros
@@ -519,8 +539,12 @@ typedef enum legion_error_t {
   ERROR_ILLEGAL_LEGION_END_TRACE = 471,
   ERROR_ILLEGAL_LEGION_BEGIN_STATIC_TRACE = 472,
   ERROR_ILLEGAL_LEGION_END_STATIC_TRACE = 473,
-  ERROR_PARENT_INDEX_PARTITION_REQUESTED = 477,
-  ERROR_FIELD_SPACE_HAS_NO_FIELD = 478,
+  ERROR_INVALID_PHYSICAL_TRACING = 474,
+  ERROR_INCOMPLETE_PHYSICAL_TRACING = 475,
+  ERROR_PHYSICAL_TRACING_UNSUPPORTED_OP = 476,
+  ERROR_PHYSICAL_TRACING_REMOTE_MAPPING = 477,
+  ERROR_PARENT_INDEX_PARTITION_REQUESTED = 478,
+  ERROR_FIELD_SPACE_HAS_NO_FIELD = 479,
   ERROR_PARENT_LOGICAL_PARTITION_REQUESTED = 480,
   ERROR_INVALID_REQUEST_FOR_INDEXSPACE = 481,
   ERROR_UNABLE_FIND_ENTRY = 482,
@@ -549,7 +573,12 @@ typedef enum legion_error_t {
   ERROR_ATTACH_OPERATION_MISSING_POINTER = 546,
   ERROR_RESERVED_VARIANT_ID = 547,
   ERROR_NON_DENSE_RECTANGLE = 548,
-  
+  ERROR_LIBRARY_COUNT_MISMATCH = 549, 
+  ERROR_MPI_INTEROP_MISCONFIGURATION = 550,
+  ERROR_NUMBER_SRC_INDIRECT_REQUIREMENTS = 551,
+  ERROR_NUMBER_DST_INDIRECT_REQUIREMENTS = 552,
+  ERROR_COPY_GATHER_REQUIREMENT = 553,
+  ERROR_COPY_SCATTER_REQUIREMENT = 554,
   
 
   LEGION_WARNING_FUTURE_NONLEAF = 1000,
@@ -600,6 +629,9 @@ typedef enum legion_error_t {
   LEGION_WARNING_UNUSED_PROFILING_FILE_NAME = 1092,
   LEGION_WARNING_INVALID_PRIORITY_CHANGE = 1093,
   LEGION_WARNING_EXTERNAL_ATTACH_OPERATION = 1094,
+  LEGION_WARNING_EXTERNAL_GARBAGE_PRIORITY = 1095,
+  LEGION_WARNING_MAPPER_INVALID_INSTANCE = 1096,
+  LEGION_WARNING_NON_REPLAYABLE_COUNT_EXCEEDED = 1097,
   
   
   LEGION_FATAL_MUST_EPOCH_NOADDRESS = 2000,
@@ -608,18 +640,25 @@ typedef enum legion_error_t {
   LEGION_FATAL_SHIM_MAPPER_SUPPORT = 2006,
   LEGION_FATAL_UNKNOWN_FIELD_ID = 2007,
   LEGION_FATAL_RESTRICTED_SIMULTANEOUS = 2008,
+  LEGION_FATAL_EXCEEDED_LIBRARY_ID_OFFSET = 2009,
   
   
 }  legion_error_t;
 
 // enum and namepsaces don't really get along well
+// We would like to make these associations explicit
+// but the python cffi parser is stupid as hell
 typedef enum legion_privilege_mode_t {
   NO_ACCESS       = 0x00000000, 
-  READ_ONLY       = 0x00000001,
-  READ_WRITE      = 0x00000007, // All three privileges
-  WRITE_ONLY      = 0x00000002, // same as WRITE_DISCARD
-  WRITE_DISCARD   = 0x00000002, // same as WRITE_ONLY
-  REDUCE          = 0x00000004,
+  READ_PRIV       = 0x00000001,
+  READ_ONLY       = 0x00000001, // READ_PRIV,
+  WRITE_PRIV      = 0x00000002,
+  REDUCE_PRIV     = 0x00000004,
+  REDUCE          = 0x00000004, // REDUCE_PRIV,
+  READ_WRITE      = 0x00000007, // READ_PRIV | WRITE_PRIV | REDUCE_PRIV,
+  DISCARD_MASK    = 0x10000000, // For marking we don't need inputs
+  WRITE_ONLY      = 0x10000002, // WRITE_PRIV | DISCARD_MASK,
+  WRITE_DISCARD   = 0x10000007, // READ_WRITE | DISCARD_MASK,
 } legion_privilege_mode_t;
 
 typedef enum legion_allocate_mode_t {
@@ -641,11 +680,19 @@ typedef enum legion_coherence_property_t {
 
 // Optional region requirement flags
 typedef enum legion_region_flags_t {
-  NO_FLAG         = 0x00000000,
-  VERIFIED_FLAG   = 0x00000001,
-  NO_ACCESS_FLAG  = 0x00000002, // Deprecated, user SpecializedConstraint
-  RESTRICTED_FLAG = 0x00000004,
-  MUST_PREMAP_FLAG= 0x00000008,
+  NO_FLAG             = 0x00000000,
+  VERIFIED_FLAG       = 0x00000001,
+  NO_ACCESS_FLAG      = 0x00000002, // Deprecated, user SpecializedConstraint
+  RESTRICTED_FLAG     = 0x00000004,
+  MUST_PREMAP_FLAG    = 0x00000008,
+  // For non-trivial projection functions: 
+  // tell the runtime the write is complete,
+  // will be ignored for non-index space launches
+  // and for privileges that aren't WRITE
+  // Note that if you use this incorrectly it could
+  // break the correctness of your code so be sure
+  // you know what you are doing
+  COMPLETE_PROJECTION_WRITE_FLAG = 0x00000010,
 } legion_region_flags_t;
 
 typedef enum legion_projection_type_t {
@@ -657,9 +704,15 @@ typedef enum legion_projection_type_t {
 typedef legion_projection_type_t legion_handle_type_t;
 
 typedef enum legion_partition_kind_t {
-  DISJOINT_KIND,
-  ALIASED_KIND,
-  COMPUTE_KIND,
+  DISJOINT_KIND, // disjoint and unknown
+  ALIASED_KIND, // aliased and unknown
+  COMPUTE_KIND, // unknown and unknown
+  DISJOINT_COMPLETE_KIND, // disjoint and complete
+  ALIASED_COMPLETE_KIND, // aliased and complete
+  COMPUTE_COMPLETE_KIND, // unknown and complete
+  DISJOINT_INCOMPLETE_KIND, // disjoint and incomplete
+  ALIASED_INCOMPLETE_KIND, // aliased and incomplete
+  COMPUTE_INCOMPLETE_KIND, // unknown and incomplete
 } legion_partition_kind_t;
 
 typedef enum legion_external_resource_t {
@@ -834,10 +887,8 @@ typedef unsigned int legion_generation_id_t;
 typedef unsigned int legion_type_handle;
 typedef unsigned int legion_projection_id_t;
 typedef unsigned int legion_region_tree_id_t;
-typedef unsigned int legion_address_space_id_t;
 typedef unsigned int legion_tunable_id_t;
 typedef unsigned int legion_local_variable_id_t;
-typedef unsigned int legion_generator_id_t;
 typedef unsigned long long legion_distributed_id_t;
 typedef unsigned long legion_mapping_tag_id_t;
 typedef unsigned long legion_variant_id_t;

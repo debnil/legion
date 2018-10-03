@@ -26,6 +26,8 @@
 #define STATIC_BREADTH_FIRST          false
 #define STATIC_STEALING_ENABLED       false
 #define STATIC_MAX_SCHEDULE_COUNT     8
+#define STATIC_MEMOIZE                false
+#define STATIC_MAP_LOCALLY            false
 
 // This is the default implementation of the mapper interface for 
 // the general low level runtime
@@ -65,7 +67,9 @@ namespace Legion {
         max_steal_count(STATIC_MAX_STEAL_COUNT),
         breadth_first_traversal(STATIC_BREADTH_FIRST),
         stealing_enabled(STATIC_STEALING_ENABLED),
-        max_schedule_count(STATIC_MAX_SCHEDULE_COUNT)
+        max_schedule_count(STATIC_MAX_SCHEDULE_COUNT),
+        memoize(STATIC_MEMOIZE),
+        map_locally(STATIC_MAP_LOCALLY)
     //--------------------------------------------------------------------------
     {
       log_mapper.spew("Initializing the default mapper for "
@@ -85,7 +89,7 @@ namespace Legion {
           } } while(0);
 #define BOOL_ARG(argname, varname) do {       \
           if (!strcmp(argv[i], argname)) {    \
-            varname = (atoi(argv[++i]) != 0); \
+            varname = true;                   \
             continue;                         \
           } } while(0);
           INT_ARG("-dm:thefts", max_steals_per_theft);
@@ -93,6 +97,8 @@ namespace Legion {
           BOOL_ARG("-dm:steal", stealing_enabled);
           BOOL_ARG("-dm:bft", breadth_first_traversal);
           INT_ARG("-dm:sched", max_schedule_count);
+          BOOL_ARG("-dm:memoize", memoize);
+          BOOL_ARG("-dm:map_locally", map_locally);
 #undef BOOL_ARG
 #undef INT_ARG
         }
@@ -231,6 +237,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_gpus.size();
       }
       if (!local_ios.empty()) {
         for (unsigned idx = 0; idx < remote_ios.size(); idx++) {
@@ -243,6 +250,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_ios.size();
       }
       if (!local_omps.empty()) {
         for (unsigned idx = 0; idx < remote_omps.size(); idx++) {
@@ -255,6 +263,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_omps.size();
       } 
       if (!local_pys.empty()) {
         for (unsigned idx = 0; idx < remote_pys.size(); idx++) {
@@ -267,6 +276,7 @@ namespace Legion {
             assert(false);
           }
         }
+        if (total_nodes == 0) total_nodes = remote_pys.size();
       } 
       // Initialize our random number generator
       const size_t short_bits = 8*sizeof(unsigned short);
@@ -346,8 +356,9 @@ namespace Legion {
       output.initial_proc = default_policy_select_initial_processor(ctx, task);
       output.inline_task = false;
       output.stealable = stealing_enabled; 
-      // Unlike in the past, this is now the best choice
-      output.map_locally = false;
+      // This is the best choice for the default mapper assuming
+      // there is locality in the remote mapped tasks
+      output.map_locally = map_locally;
     }
 
     //--------------------------------------------------------------------------
@@ -1837,7 +1848,11 @@ namespace Legion {
         {
           for (std::deque<PhysicalInstance>::const_iterator it =
                 to_downgrade.begin(); it != to_downgrade.end(); it++)
+          {
+            if (it->is_external_instance())
+              continue;
             runtime->set_garbage_collection_priority(ctx, *it, 0/*priority*/);
+          }
         }
       }
     }
@@ -1995,8 +2010,11 @@ namespace Legion {
       // There are no constraints for these fields so we get to do what we want
       instances.resize(instances.size()+1);
       LayoutConstraintSet creation_constraints = our_constraints;
+      std::vector<FieldID> creation_fields;
+      default_policy_select_instance_fields(ctx, req, needed_fields,
+          creation_fields);
       creation_constraints.add_constraint(
-          FieldConstraint(needed_fields, false/*contig*/, false/*inorder*/));
+          FieldConstraint(creation_fields, false/*contig*/, false/*inorder*/));
       if (!default_make_instance(ctx, target_memory, creation_constraints, 
                 instances.back(), TASK_MAPPING, force_new_instances, 
                 true/*meets*/,  req))
@@ -2217,6 +2235,8 @@ namespace Legion {
       LogicalRegion target_region = 
         default_policy_select_instance_region(ctx, target_memory, req,
                                               constraints, force_new, meets);
+      bool tight_region_bounds = (req.tag & DefaultMapper::EXACT_REGION) != 0;
+
       // TODO: deal with task layout constraints that require multiple
       // region requirements to be mapped to the same instance
       std::vector<LogicalRegion> target_regions(1, target_region);
@@ -2226,14 +2246,15 @@ namespace Legion {
           return false;
       } else {
         if (!runtime->find_or_create_physical_instance(ctx, 
-              target_memory, constraints, target_regions, result, created))
+              target_memory, constraints, target_regions, result, created,
+              true/*acquire*/, 0/*priority*/, tight_region_bounds))
           return false;
       }
       if (created)
       {
         int priority = default_policy_select_garbage_collection_priority(ctx, 
                 kind, target_memory, result, meets, (req.privilege == REDUCE));
-        if (priority != 0)
+        if ((priority != 0) && !result.is_external_instance())
           runtime->set_garbage_collection_priority(ctx, result,priority);
       }
       return true;
@@ -2321,6 +2342,26 @@ namespace Legion {
         return result;
       }
     }
+
+    //--------------------------------------------------------------------------
+    void DefaultMapper::default_policy_select_instance_fields(
+                                    MapperContext ctx,
+                                    const RegionRequirement &req,
+                                    const std::set<FieldID> &needed_fields,
+                                    std::vector<FieldID> &fields)
+    //--------------------------------------------------------------------------
+    {
+      if (total_nodes == 1)
+      {
+        FieldSpace handle = req.region.get_field_space();
+        runtime->get_field_space_fields(ctx, handle, fields);
+      }
+      else
+      {
+        fields.insert(fields.end(), needed_fields.begin(), needed_fields.end());
+      }
+    }
+
 
     //--------------------------------------------------------------------------
     int DefaultMapper::default_policy_select_garbage_collection_priority(
@@ -2424,13 +2465,7 @@ namespace Legion {
           machine.get_mem_mem_affinity(affinity, location, destination_memory,
 				       false /*not just local affinities*/);
           unsigned memory_bandwidth = 0;
-          if (affinity.empty()) {
-            // TODO: More graceful way of dealing with multi-hop copies
-            log_mapper.warning("Default mapper is potentially "
-                               "requesting a multi-hop copy between memories "
-                               IDFMT " and " IDFMT "!", location.id,
-                               destination_memory.id);
-          } else {
+          if (!affinity.empty()) {
             assert(affinity.size() == 1);
             memory_bandwidth = affinity[0].bandwidth;
           }
@@ -2571,12 +2606,24 @@ namespace Legion {
       else
       {
         // No constraints so do what we want
-        // Copy over all the valid instances, then try to do an acquire on them
-        // and see which instances are no longer valid
-        output.chosen_instances = input.valid_instances;
-        if (!output.chosen_instances.empty())
-          runtime->acquire_and_filter_instances(ctx, 
-                                            output.chosen_instances);
+        target_memory = default_policy_select_target_memory(ctx,
+                                        inline_op.parent_task->current_proc,
+                                        inline_op.requirement);
+        // Copy over any valid instances for our target memory, then try to 
+        // do an acquire on them and see which instances are no longer valid
+        if (!input.valid_instances.empty())
+        {
+          for (std::vector<PhysicalInstance>::const_iterator it = 
+                input.valid_instances.begin(); it != 
+                input.valid_instances.end(); it++)
+          {
+            if (it->get_location() == target_memory)
+              output.chosen_instances.push_back(*it);
+          }
+          if (!output.chosen_instances.empty())
+            runtime->acquire_and_filter_instances(ctx, 
+                                              output.chosen_instances);
+        }
         // Now see if we have any fields which we still make space for
         std::set<FieldID> missing_fields = 
           inline_op.requirement.privilege_fields;
@@ -2592,9 +2639,6 @@ namespace Legion {
         if (missing_fields.empty())
           return;
         // Otherwise, let's make an instance for our missing fields
-        target_memory = default_policy_select_target_memory(ctx,
-                                        inline_op.parent_task->current_proc,
-                                        inline_op.requirement);
         LayoutConstraintID our_layout_id = 
          default_policy_select_layout_constraints(ctx, target_memory, 
                                                inline_op.requirement, 
@@ -2675,6 +2719,9 @@ namespace Legion {
     //--------------------------------------------------------------------------
     {
       log_mapper.spew("Default map_copy in %s", get_mapper_name());
+      // Default mapper doesn't support gather/scatter copies yet
+      assert(copy.src_indirect_requirements.empty());
+      assert(copy.dst_indirect_requirements.empty());
       // For the sources always use an existing instances and virtual
       // instances for the rest, for the destinations, hope they are
       // restricted, otherwise we really don't know what to do
@@ -3679,6 +3726,16 @@ namespace Legion {
     {
       log_mapper.spew("Default map_dataflow_graph in %s", get_mapper_name());
       // TODO: Implement this
+    }
+
+    //--------------------------------------------------------------------------
+    void DefaultMapper::memoize_operation(const MapperContext  ctx,
+                                          const Mappable&      mappable,
+                                          const MemoizeInput&  input,
+                                                MemoizeOutput& output)
+    //--------------------------------------------------------------------------
+    {
+      output.memoize = memoize;
     }
 
     //--------------------------------------------------------------------------

@@ -51,6 +51,9 @@ namespace Realm {
 			      Event start_event, Event finish_event,
                               int priority) = 0;
 
+      // starts worker threads and performs any per-processor initialization
+      virtual void start_threads(void);
+
       // blocks until things are cleaned up
       virtual void shutdown(void);
 
@@ -90,6 +93,9 @@ namespace Realm {
       virtual void register_task(Processor::TaskFuncID func_id,
 				 CodeDescriptor& codedesc,
 				 const ByteArrayRef& user_data);
+
+      // starts worker threads and performs any per-processor initialization
+      virtual void start_threads(void);
 
       // blocks until things are cleaned up
       virtual void shutdown(void);
@@ -137,7 +143,8 @@ namespace Realm {
     class LocalUtilityProcessor : public LocalTaskProcessor {
     public:
       LocalUtilityProcessor(Processor _me, CoreReservationSet& crs,
-			    size_t _stack_size, bool _force_kthreads);
+			    size_t _stack_size, bool _force_kthreads,
+                            bool _pin_util_proc);
       virtual ~LocalUtilityProcessor(void);
     protected:
       CoreReservation *core_rsrv;

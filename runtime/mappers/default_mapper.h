@@ -295,6 +295,11 @@ namespace Legion {
       virtual void map_dataflow_graph(const MapperContext           ctx,
                                       const MapDataflowGraphInput&  input,
                                             MapDataflowGraphOutput& output);
+    public: // Memoization control
+      virtual void memoize_operation(const MapperContext  ctx,
+                                     const Mappable&      mappable,
+                                     const MemoizeInput&  input,
+                                           MemoizeOutput& output);
     public: // Mapping control and stealing
       virtual void select_tasks_to_map(const MapperContext          ctx,
                                        const SelectMappingInput&    input,
@@ -370,6 +375,11 @@ namespace Legion {
                                     const LayoutConstraintSet &constraints,
                                     bool force_new_instances, 
                                     bool meets_constraints);
+      virtual void default_policy_select_instance_fields(
+                                    MapperContext ctx,
+                                    const RegionRequirement &req,
+                                    const std::set<FieldID> &needed_fields,
+                                    std::vector<FieldID> &fields);
       virtual int default_policy_select_garbage_collection_priority(
                                     MapperContext ctx, 
                                     MappingKind kind, Memory memory, 
@@ -533,6 +543,12 @@ namespace Legion {
       bool stealing_enabled;
       // The maximum number of tasks scheduled per step
       unsigned max_schedule_count;
+      // Memoize physical analysis for logically traced operations
+      // Controlled by -dm:memoize (false by default)
+      bool memoize;
+      // Whether to map tasks locally
+      // Controlled by -dm:map_locally (false by default)
+      bool map_locally;
     };
 
   }; // namespace Mapping

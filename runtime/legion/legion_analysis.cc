@@ -148,7 +148,7 @@ namespace Legion {
                                  const FieldMask &k, std::set<RtEvent> &e)
       : ctx(c), op(o), index(idx), req(r), version_info(info),
         traversal_mask(k), context_uid(o->get_context()->get_context_uid()),
-        map_applied_events(e)
+        map_applied_events(e), logical_ctx(-1U)
     //--------------------------------------------------------------------------
     {
     }
@@ -307,7 +307,7 @@ namespace Legion {
               args.state = state;
               args.kind = REF_KIND;
               return runtime->issue_runtime_meta_task(args, 
-                      LG_LATENCY_WORK_PRIORITY, NULL, pre);
+                      LG_LATENCY_WORK_PRIORITY, pre);
             }
             else
             {
@@ -339,7 +339,7 @@ namespace Legion {
               args.state = state;
               args.kind = REF_KIND;
               return runtime->issue_runtime_meta_task(args, 
-                      LG_LATENCY_WORK_PRIORITY, NULL, pre);
+                      LG_LATENCY_WORK_PRIORITY, pre);
             }
             else
             {
@@ -368,7 +368,7 @@ namespace Legion {
               args.state = state;
               args.kind = REF_KIND;
               return runtime->issue_runtime_meta_task(args, 
-                      LG_LATENCY_WORK_PRIORITY, NULL, pre);
+                      LG_LATENCY_WORK_PRIORITY, pre);
             }
             else
             {
@@ -1396,7 +1396,7 @@ namespace Legion {
           DeferRestrictedManagerArgs args;
           args.manager = manager;
           ready = runtime->issue_runtime_meta_task(args, 
-              LG_LATENCY_DEFERRED_PRIORITY, NULL, ready);
+              LG_LATENCY_DEFERRED_PRIORITY, ready);
           ready_events.insert(ready);
         }
         else
@@ -1883,12 +1883,12 @@ namespace Legion {
     }
 
     /////////////////////////////////////////////////////////////
-    // TraceInfo 
+    // LogicalTraceInfo 
     /////////////////////////////////////////////////////////////
 
     //--------------------------------------------------------------------------
-    TraceInfo::TraceInfo(bool already_tr, LegionTrace *tr, unsigned idx,
-                         const RegionRequirement &r)
+    LogicalTraceInfo::LogicalTraceInfo(bool already_tr, LegionTrace *tr, 
+                                       unsigned idx, const RegionRequirement &r)
       : already_traced(already_tr), trace(tr), req_idx(idx), req(r)
     //--------------------------------------------------------------------------
     {
@@ -2834,7 +2834,8 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     void FieldState::print_state(TreeStateLogger *logger,
-                                 const FieldMask &capture_mask) const
+                                 const FieldMask &capture_mask,
+                                 RegionNode *node) const
     //--------------------------------------------------------------------------
     {
       switch (open_state)
@@ -2872,19 +2873,31 @@ namespace Legion {
         case OPEN_READ_ONLY_PROJ:
           {
             logger->log("Field State: OPEN READ-ONLY PROJECTION %d",
-                        projection);
+                        projection->projection_id);
             break;
           }
         case OPEN_READ_WRITE_PROJ:
           {
             logger->log("Field State: OPEN READ WRITE PROJECTION %d",
-                        projection);
+                        projection->projection_id);
+            break;
+          }
+        case OPEN_READ_WRITE_PROJ_DISJOINT_SHALLOW:
+          {
+            logger->log("Field State: OPEN READ WRITE PROJECTION (Disjoint Shallow) %d",
+                        projection->projection_id);
             break;
           }
         case OPEN_REDUCE_PROJ:
           {
             logger->log("Field State: OPEN REDUCE PROJECTION %d Mode %d",
-                        projection, redop);
+                        projection->projection_id, redop);
+            break;
+          }
+        case OPEN_REDUCE_PROJ_DIRTY:
+          {
+            logger->log("Field State: OPEN REDUCE PROJECTION (Dirty) %d Mode %d",
+                        projection->projection_id, redop);
             break;
           }
         default:
@@ -2899,6 +2912,115 @@ namespace Legion {
           continue;
         char *mask_buffer = overlap.to_string();
         logger->log("Color %d   Mask %s", it->first, mask_buffer);
+        free(mask_buffer);
+      }
+      logger->up();
+    }
+
+    //--------------------------------------------------------------------------
+    void FieldState::print_state(TreeStateLogger *logger,
+                                 const FieldMask &capture_mask,
+                                 PartitionNode *node) const
+    //--------------------------------------------------------------------------
+    {
+      switch (open_state)
+      {
+        case NOT_OPEN:
+          {
+            logger->log("Field State: NOT OPEN (%ld)", 
+                        open_children.size());
+            break;
+          }
+        case OPEN_READ_WRITE:
+          {
+            logger->log("Field State: OPEN READ WRITE (%ld)", 
+                        open_children.size());
+            break;
+          }
+        case OPEN_READ_ONLY:
+          {
+            logger->log("Field State: OPEN READ-ONLY (%ld)", 
+                        open_children.size());
+            break;
+          }
+        case OPEN_SINGLE_REDUCE:
+          {
+            logger->log("Field State: OPEN SINGLE REDUCE Mode %d (%ld)", 
+                        redop, open_children.size());
+            break;
+          }
+        case OPEN_MULTI_REDUCE:
+          {
+            logger->log("Field State: OPEN MULTI REDUCE Mode %d (%ld)", 
+                        redop, open_children.size());
+            break;
+          }
+        case OPEN_READ_ONLY_PROJ:
+          {
+            logger->log("Field State: OPEN READ-ONLY PROJECTION %d",
+                        projection->projection_id);
+            break;
+          }
+        case OPEN_READ_WRITE_PROJ:
+          {
+            logger->log("Field State: OPEN READ WRITE PROJECTION %d",
+                        projection->projection_id);
+            break;
+          }
+        case OPEN_READ_WRITE_PROJ_DISJOINT_SHALLOW:
+          {
+            logger->log("Field State: OPEN READ WRITE PROJECTION (Disjoint Shallow) %d",
+                        projection->projection_id);
+            break;
+          }
+        case OPEN_REDUCE_PROJ:
+          {
+            logger->log("Field State: OPEN REDUCE PROJECTION %d Mode %d",
+                        projection->projection_id, redop);
+            break;
+          }
+        case OPEN_REDUCE_PROJ_DIRTY:
+          {
+            logger->log("Field State: OPEN REDUCE PROJECTION (Dirty) %d Mode %d",
+                        projection->projection_id, redop);
+            break;
+          }
+        default:
+          assert(false);
+      }
+      logger->down();
+      for (LegionMap<LegionColor,FieldMask>::aligned::const_iterator it = 
+            open_children.begin(); it != open_children.end(); it++)
+      {
+        DomainPoint color =
+          node->row_source->color_space->delinearize_color_to_point(it->first);
+        FieldMask overlap = it->second & capture_mask;
+        if (!overlap)
+          continue;
+        char *mask_buffer = overlap.to_string();
+        switch (color.get_dim())
+        {
+          case 1:
+            {
+              logger->log("Color %d   Mask %s", 
+                          color[0], mask_buffer);
+              break;
+            }
+          case 2:
+            {
+              logger->log("Color (%d,%d)   Mask %s", 
+                          color[0], color[1], mask_buffer);
+              break;
+            }
+          case 3:
+            {
+              logger->log("Color (%d,%d,%d)   Mask %s", 
+                          color[0], color[1], color[2], mask_buffer);
+              break;
+            }
+          default:
+            assert(false); // implemenent more dimensions
+        }
         free(mask_buffer);
       }
       logger->up();
@@ -3378,6 +3500,55 @@ namespace Legion {
       return result;
     }
 
+    void ClosedNode::record_closed_tree(const FieldMask &fields,
+                                        ContextID logical_ctx,
+                 LegionMap<std::pair<RegionTreeNode*,ContextID>,
+                           FieldMask>::aligned &nodes,
+                 std::map<std::pair<RegionTreeNode*,ContextID>,
+                          LegionMap<IndexSpaceNode*,FieldMask>::aligned> &projs)
+    //--------------------------------------------------------------------------
+    {
+      std::pair<RegionTreeNode*,ContextID> key(node, logical_ctx);
+      if (children.size() == 0 && projections.size() == 0)
+      {
+        LegionMap<std::pair<RegionTreeNode*,ContextID>,
+                  FieldMask>::aligned::iterator finder = nodes.find(key);
+        if (finder == nodes.end())
+            nodes[key] = fields;
+        else
+          finder->second |= fields;
+        return;
+      }
+      std::map<std::pair<RegionTreeNode*,ContextID>,
+               LegionMap<IndexSpaceNode*,FieldMask>::aligned>::iterator finder =
+                 projs.find(key);
+      for (std::map<ProjectionFunction*,
+           LegionMap<IndexSpaceNode*,FieldMask>::aligned>::const_iterator pit =
+           projections.begin(); pit != projections.end(); pit++)
+      {
+        for (LegionMap<IndexSpaceNode*,FieldMask>::aligned::const_iterator it =
+              pit->second.begin(); it != pit->second.end(); it++)
+        {
+          FieldMask overlap = it->second & fields;
+          if (!overlap) continue;
+          if (finder == projs.end())
+          {
+            projs[key] = LegionMap<IndexSpaceNode*,FieldMask>::aligned();
+            finder = projs.find(key);
+          }
+          LegionMap<IndexSpaceNode*,FieldMask>::aligned::iterator finder2 =
+            finder->second.find(it->first);
+          if (finder2 == finder->second.end())
+            finder->second[it->first] = overlap;
+          else
+            finder2->second |= overlap;
+        }
+      }
+      for (std::map<RegionTreeNode*,ClosedNode*>::const_iterator it =
+            children.begin(); it != children.end(); it++)
+        it->second->record_closed_tree(fields, logical_ctx, nodes, projs);
+    }
+
     /////////////////////////////////////////////////////////////
     // Logical Closer 
     /////////////////////////////////////////////////////////////
@@ -3425,7 +3596,7 @@ namespace Legion {
       assert(!!mask);
 #endif
       normal_close_mask |= mask;
-      if (projection)
+      if (projection && !disjoint_close)
         closed_projections |= mask;
       if (disjoint_close)
       {
@@ -3526,9 +3697,9 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     void LogicalCloser::initialize_close_operations(LogicalState &state, 
-                                                   Operation *creator,
-                                                   const VersionInfo &ver_info,
-                                                   const TraceInfo &trace_info)
+                                             Operation *creator,
+                                             const VersionInfo &ver_info,
+                                             const LogicalTraceInfo &trace_info)
     //--------------------------------------------------------------------------
     {
 #ifdef DEBUG_LEGION
@@ -3546,7 +3717,7 @@ namespace Legion {
                                 READ_WRITE, EXCLUSIVE, trace_info.req.parent);
       if (!!normal_close_mask)
       {
-        normal_close_op = creator->runtime->get_available_inter_close_op(false);
+        normal_close_op = creator->runtime->get_available_inter_close_op();
         normal_close_gen = normal_close_op->get_generation();
         // Compute the set of fields that we need
         root_node->column_source->get_field_set(normal_close_mask,
@@ -3584,7 +3755,7 @@ namespace Legion {
       if (!!read_only_close_mask)
       {
         read_only_close_op = 
-          creator->runtime->get_available_read_close_op(false);
+          creator->runtime->get_available_read_close_op();
         read_only_close_gen = read_only_close_op->get_generation();
         req.privilege_fields.clear();
         root_node->column_source->get_field_set(read_only_close_mask,
@@ -3599,7 +3770,7 @@ namespace Legion {
       if (!!flush_only_close_mask)
       {
         flush_only_close_op =
-          creator->runtime->get_available_inter_close_op(false);
+          creator->runtime->get_available_inter_close_op();
         flush_only_close_gen = flush_only_close_op->get_generation();
         req.privilege_fields.clear();
         // Compute the set of fields that we need
@@ -4096,7 +4267,6 @@ namespace Legion {
 
     //--------------------------------------------------------------------------
     void PhysicalState::print_physical_state(const FieldMask &capture_mask,
-                         LegionMap<LegionColor,FieldMask>::aligned &to_traverse,
                                              TreeStateLogger *logger)
     //--------------------------------------------------------------------------
     {
@@ -4106,6 +4276,13 @@ namespace Legion {
         char *dirty_buffer = overlap.to_string();
         logger->log("Dirty Mask: %s",dirty_buffer);
         free(dirty_buffer);
+      }
+      // Reduction Mask
+      {
+        FieldMask overlap = reduction_mask & capture_mask;
+        char *reduction_buffer = overlap.to_string();
+        logger->log("Reduction Mask: %s",reduction_buffer);
+        free(reduction_buffer);
       }
       // Valid Views
       {
@@ -4117,28 +4294,46 @@ namespace Legion {
             continue;
           num_valid++;
         }
-        logger->log("Valid Instances (%d)", num_valid);
-        logger->down();
-        for (LegionMap<LogicalView*,FieldMask>::aligned::const_iterator it = 
-              valid_views.begin(); it != valid_views.end(); it++)
+        if (num_valid > 0)
         {
-          FieldMask overlap = it->second & capture_mask;
-          if (!overlap)
-            continue;
-          if (it->first->is_deferred_view())
-            continue;
+          logger->log("Valid Instances (%d)", num_valid);
+          logger->down();
+          for (LegionMap<LogicalView*,FieldMask>::aligned::const_iterator it = 
+                valid_views.begin(); it != valid_views.end(); it++)
+          {
+            FieldMask overlap = it->second & capture_mask;
+            if (!overlap)
+              continue;
+            if (it->first->is_deferred_view())
+            {
+              if (it->first->is_composite_view())
+              {
+                CompositeView *composite_view = it->first->as_composite_view();
+                if (composite_view != NULL)
+                {
+                  logger->log("=== Composite Instance ===");
+                  logger->down();
+                  // We go only two levels down into the nested composite views
+                  composite_view->print_view_state(capture_mask, logger, 0, 2);
+                  logger->up();
+                  logger->log("==========================");
+                }
+              }
+              continue;
+            }
 #ifdef DEBUG_LEGION
-          assert(it->first->as_instance_view()->is_materialized_view());
+            assert(it->first->as_instance_view()->is_materialized_view());
 #endif
-          MaterializedView *current = 
-            it->first->as_instance_view()->as_materialized_view();
-          char *valid_mask = overlap.to_string();
-          logger->log("Instance " IDFMT "   Memory " IDFMT "   Mask %s",
-                      current->manager->get_instance().id, 
-                      current->manager->get_memory().id, valid_mask);
-          free(valid_mask);
+            MaterializedView *current = 
+              it->first->as_instance_view()->as_materialized_view();
+            char *valid_mask = overlap.to_string();
+            logger->log("Instance " IDFMT "   Memory " IDFMT "   Mask %s",
+                        current->manager->get_instance().id, 
+                        current->manager->get_memory().id, valid_mask);
+            free(valid_mask);
+          }
+          logger->up();
         }
-        logger->up();
       }
       // Valid Reduction Views
       {
@@ -4151,23 +4346,26 @@ namespace Legion {
             continue;
           num_valid++;
         }
-        logger->log("Valid Reduction Instances (%d)", num_valid);
-        logger->down();
-        for (LegionMap<ReductionView*,FieldMask>::aligned::const_iterator it = 
-              reduction_views.begin(); it != 
-              reduction_views.end(); it++)
+        if (num_valid > 0)
         {
-          FieldMask overlap = it->second & capture_mask;
-          if (!overlap)
-            continue;
-          char *valid_mask = overlap.to_string();
-          logger->log("Reduction Instance " IDFMT "   Memory " IDFMT 
-                      "  Mask %s",
-                      it->first->manager->get_instance().id, 
-                      it->first->manager->get_memory().id, valid_mask);
-          free(valid_mask);
+          logger->log("Valid Reduction Instances (%d)", num_valid);
+          logger->down();
+          for (LegionMap<ReductionView*,FieldMask>::aligned::const_iterator it = 
+                reduction_views.begin(); it != 
+                reduction_views.end(); it++)
+          {
+            FieldMask overlap = it->second & capture_mask;
+            if (!overlap)
+              continue;
+            char *valid_mask = overlap.to_string();
+            logger->log("Reduction Instance " IDFMT "   Memory " IDFMT 
+                        "  Mask %s",
+                        it->first->manager->get_instance().id, 
+                        it->first->manager->get_memory().id, valid_mask);
+            free(valid_mask);
+          }
+          logger->up();
         }
-        logger->up();
       }
     } 
 
@@ -4184,7 +4382,6 @@ namespace Legion {
         current_context(NULL), is_owner(false)
     //--------------------------------------------------------------------------
     {
-      manager_lock = Reservation::create_reservation();
     }
 
     //--------------------------------------------------------------------------
@@ -4200,8 +4397,6 @@ namespace Legion {
     VersionManager::~VersionManager(void)
     //--------------------------------------------------------------------------
     {
-      manager_lock.destroy_reservation();
-      manager_lock = Reservation::NO_RESERVATION;
     }
 
     //--------------------------------------------------------------------------
@@ -4319,16 +4514,14 @@ namespace Legion {
               !(version_mask * pending_remote_advance_summary))
           {
             // Release the lock before sending the message
-            Runtime::release_reservation(manager_lock);
+            m_lock.release();
             // Always pass in the full mask as the call will recompute
             // the request_mask in case we lose a race
             RtEvent wait_on = send_remote_version_request(version_mask,
                                                           ready_events);
+            wait_on.wait();
             // Only retake the reservation, when we are ready
-            RtEvent lock_reacquired = Runtime::acquire_rt_reservation(
-                            manager_lock, false/*exclusive*/, wait_on);
-            // Might as well wait since we just sent a message
-            lock_reacquired.lg_wait();
+            m_lock.reacquire();
 #ifdef DEBUG_LEGION
             // When we wake up everything should be good
             assert(!(version_mask - remote_valid_fields));
@@ -4383,16 +4576,14 @@ namespace Legion {
               !(version_mask * pending_remote_advance_summary))
           {
             // Release the lock before sending the message
-            Runtime::release_reservation(manager_lock);
+            m_lock.release();
             // Always pass in the full mask as the call will recompute
             // the request_mask in case we lose a race
             RtEvent wait_on = send_remote_version_request(version_mask,
                                                           ready_events);
             // Only retake the reservation, when we are ready
-            RtEvent lock_reacquired = Runtime::acquire_rt_reservation(
-                            manager_lock, false/*exclusive*/, wait_on);
-            // Might as well wait since we just sent a message
-            lock_reacquired.lg_wait();
+            wait_on.wait();
+            m_lock.reacquire();
 #ifdef DEBUG_LEGION
             // When we wake up everything should be good
             assert(!(version_mask - remote_valid_fields));
@@ -4465,7 +4656,7 @@ namespace Legion {
             rez.serialize(wait_on);
           }
           runtime->send_version_manager_unversioned_request(owner_space, rez);
-          wait_on.lg_wait();
+          wait_on.wait();
         }
         else
         {
@@ -4515,16 +4706,14 @@ namespace Legion {
             !(version_mask * pending_remote_advance_summary))
         {
           // Release the lock before sending the message
-          Runtime::release_reservation(manager_lock);
+          m_lock.release();
           // Always pass in the full mask as the call will recompute
           // the request_mask in case we lose a race
           RtEvent wait_on = send_remote_version_request(version_mask,
                                                         ready_events);
           // Retake the lock only once we're ready to
-          RtEvent lock_reacquired = Runtime::acquire_rt_reservation(
-                          manager_lock, false/*exclusive*/, wait_on);
-          // Might as well wait since we're sending a remote message
-          lock_reacquired.lg_wait();
+          wait_on.wait();
+          m_lock.reacquire();
 #ifdef DEBUG_LEGION
           // When we wake up everything should be good
           assert(!(version_mask - remote_valid_fields));
@@ -4578,16 +4767,14 @@ namespace Legion {
             !(version_mask * pending_remote_advance_summary))
         {
           // Release the lock before sending the message
-          Runtime::release_reservation(manager_lock);
+          m_lock.release();
           // Always pass in the full mask as the call will recompute
           // the request_mask in case we lose a race
           RtEvent wait_on = send_remote_version_request(version_mask,
                                                         ready_events); 
           // Retake the lock only once we're ready to
-          RtEvent lock_reacquired = Runtime::acquire_rt_reservation(
-                          manager_lock, false/*exclusive*/, wait_on);
-          // Might as well wait since we're sending a remote message
-          lock_reacquired.lg_wait();
+          wait_on.wait();
+          m_lock.reacquire();
 #ifdef DEBUG_LEGION
           // When we wake up everything should be good
           assert(!(version_mask - remote_valid_fields));
@@ -4643,16 +4830,14 @@ namespace Legion {
             !(version_mask * pending_remote_advance_summary))
         {
           // Release the lock before sending the message
-          Runtime::release_reservation(manager_lock);
+          m_lock.release();
           // Always pass in the full mask as the call will recompute
           // the request_mask in case we lose a race
           RtEvent wait_on = send_remote_version_request(version_mask,
                                                         ready_events); 
           // Retake the lock only once we're ready to
-          RtEvent lock_reacquired = Runtime::acquire_rt_reservation(
-                          manager_lock, false/*exclusive*/, wait_on);
-          // Might as well wait since we're sending a remote message
-          lock_reacquired.lg_wait();
+          wait_on.wait();
+          m_lock.reacquire();
 #ifdef DEBUG_LEGION
           // When we wake up everything should be good
           assert(!(version_mask - remote_valid_fields));
@@ -4875,16 +5060,14 @@ namespace Legion {
             !(version_mask * pending_remote_advance_summary))
         {
           // Release the lock before sending the message
-          Runtime::release_reservation(manager_lock);
+          m_lock.release();
           // Always pass in the full mask as the call will recompute
           // the request_mask in case we lose a race
           RtEvent wait_on = send_remote_version_request(version_mask,
                                                         ready_events); 
           // Retake the lock only once we're ready to
-          RtEvent lock_reacquired = Runtime::acquire_rt_reservation(
-                          manager_lock, false/*exclusive*/, wait_on);
-          // Might as well wait since we're sending a remote message
-          lock_reacquired.lg_wait();
+          wait_on.wait();
+          m_lock.reacquire();
 #ifdef DEBUG_LEGION
           // When we wake up everything should be good
           assert(!(version_mask - remote_valid_fields));
@@ -4982,7 +5165,7 @@ namespace Legion {
         args.to_reclaim = advanced;
         RtEvent done = 
           runtime->issue_runtime_meta_task(args, LG_LATENCY_WORK_PRIORITY,
-                                           NULL, advanced);
+                                           advanced);
         // Add this event to the set of applied preconditions
         // in order to avoid cleanup races
         applied_events.insert(done);
@@ -5428,7 +5611,7 @@ namespace Legion {
                 args.capture_mask = new FieldMask(overlap);
                 RtEvent done = 
                   runtime->issue_runtime_meta_task(args, 
-                      LG_LATENCY_WORK_PRIORITY, NULL, precondition);
+                      LG_LATENCY_WORK_PRIORITY, precondition);
                 applied_events.insert(done);
                 state_overlap -= overlap;
                 if (!state_overlap)
@@ -5672,16 +5855,14 @@ namespace Legion {
             !(new_states.get_valid_mask() * pending_remote_advance_summary))
         {
           // Release the lock before sending the message
-          Runtime::release_reservation(manager_lock);
+          m_lock.release();
           // Always pass in the full mask as the call will recompute
           // the request_mask in case we lose a race
           RtEvent wait_on = send_remote_version_request(
               new_states.get_valid_mask(), applied_events);
           // Retake the lock only once we're ready to
-          RtEvent lock_reacquired = Runtime::acquire_rt_reservation(
-                          manager_lock, false/*exclusive*/, wait_on);
-          // Might as well wait since we're sending a remote message
-          lock_reacquired.lg_wait();
+          wait_on.wait();
+          m_lock.reacquire();
 #ifdef DEBUG_LEGION
           // When we wake up everything should be good
           assert(!(new_states.get_valid_mask() - remote_valid_fields));
@@ -5798,7 +5979,6 @@ namespace Legion {
     //--------------------------------------------------------------------------
     void VersionManager::print_physical_state(RegionTreeNode *arg_node,
                                 const FieldMask &capture_mask,
-                         LegionMap<LegionColor,FieldMask>::aligned &to_traverse,
                                 TreeStateLogger *logger)
     //--------------------------------------------------------------------------
     {
@@ -5832,14 +6012,31 @@ namespace Legion {
         free(version_buffer);
       }
       logger->up();
-      temp_state.print_physical_state(capture_mask, to_traverse, logger);
+      temp_state.print_physical_state(capture_mask, logger);
+    }
+
+    //--------------------------------------------------------------------------
+    void VersionManager::update_physical_state(PhysicalState *state)
+    //--------------------------------------------------------------------------
+    {
+      for (LegionMap<VersionID,ManagerVersions>::aligned::const_iterator vit =
+           current_version_infos.begin(); vit !=
+           current_version_infos.end(); vit++)
+      {
+        for (ManagerVersions::iterator it = vit->second.begin();
+             it != vit->second.end(); it++)
+        {
+          VersionState *vs = dynamic_cast<VersionState*>(it->first);
+          vs->update_physical_state(state, it->second);
+        }
+      }
     }
 
     //--------------------------------------------------------------------------
     VersionState* VersionManager::create_new_version_state(VersionID vid)
     //--------------------------------------------------------------------------
     {
-      DistributedID did = runtime->get_available_distributed_id(false);
+      DistributedID did = runtime->get_available_distributed_id();
       return new VersionState(vid, runtime, did, 
           runtime->address_space, node, true/*register now*/);
     }
@@ -6280,7 +6477,7 @@ namespace Legion {
       if (!preconditions.empty())
       {
         RtEvent wait_on = Runtime::merge_events(preconditions);
-        wait_on.lg_wait();
+        wait_on.wait();
       }
 #ifdef DEBUG_LEGION
       assert(applied_events != NULL);
@@ -6444,8 +6641,7 @@ namespace Legion {
       : DistributedCollectable(rt, 
           LEGION_DISTRIBUTED_HELP_ENCODE(id, VERSION_STATE_DC), 
           own_sp, register_now),
-        version_number(vid), logical_node(node), 
-        state_lock(Reservation::create_reservation())
+        version_number(vid), logical_node(node)
 #ifdef DEBUG_LEGION
         , currently_active(true), currently_valid(true)
 #endif
@@ -6477,8 +6673,6 @@ namespace Legion {
     VersionState::~VersionState(void)
     //--------------------------------------------------------------------------
     {
-      state_lock.destroy_reservation();
-      state_lock = Reservation::NO_RESERVATION;
 #ifdef DEBUG_LEGION
       if (is_owner())
         assert(!currently_valid);
@@ -7388,7 +7582,7 @@ namespace Legion {
       // meta-data for different fields (i.e. we don't track it at all
       // currently), therefore we may get requests for updates that we
       runtime->issue_runtime_meta_task(args, LG_LATENCY_DEFERRED_PRIORITY,
-                                       NULL/*op*/, precondition);
+                                       precondition);
     }
 
     //--------------------------------------------------------------------------
@@ -7753,16 +7947,9 @@ namespace Legion {
                   args.child_color = child;
                   // Takes ownership for deallocation
                   args.children = deferred_children;
-                  args.state_lock = state_lock;
-                  // Take the lock on behalf of the this task
-                  // Kind of scary asking for the lock we currently
-                  // hold but such is the world of deferred execution
-                  RtEvent actual_pre = 
-                    Runtime::acquire_rt_reservation(state_lock, 
-                        true/*exclusive*/, precondition);
                   // Need resource priority since we asked for the lock
                   RtEvent done = runtime->issue_runtime_meta_task(args, 
-                              LG_RESOURCE_PRIORITY, NULL, actual_pre);
+                          LG_LATENCY_WORK_PRIORITY, precondition);
                   preconditions.insert(done);
                 }
                 else // We can run it now
@@ -7823,14 +8010,9 @@ namespace Legion {
                   args.child_color = child;
                   // Takes ownership for deallocation
                   args.children = reduce_children;
-                  args.state_lock = state_lock;
-                  // Ask for the reservation on behalf of the task
-                  RtEvent actual_pre = 
-                    Runtime::acquire_rt_reservation(state_lock,
-                        true/*exclusive*/, precondition);
                   // Need resource priority since we asked for the lock
                   RtEvent done = runtime->issue_runtime_meta_task(args,
-                      LG_RESOURCE_PRIORITY, NULL, actual_pre);
+                          LG_LATENCY_WORK_PRIORITY, precondition);
                   preconditions.insert(done);
                 }
                 else // We can run it now
@@ -7879,7 +8061,7 @@ namespace Legion {
               args.context = context;
               std::pair<RtEvent,FieldMask> &entry = pending_instances[manager];
               entry.first = runtime->issue_runtime_meta_task(args,
-                                       LG_LATENCY_WORK_PRIORITY, NULL, ready);
+                                       LG_LATENCY_WORK_PRIORITY, ready);
               derez.deserialize(entry.second);
               preconditions.insert(entry.first);
             }
@@ -8025,7 +8207,7 @@ namespace Legion {
           args.view = it->first;
           preconditions.insert(
               runtime->issue_runtime_meta_task(args, LG_LATENCY_WORK_PRIORITY,
-                                               NULL, it->second));
+                                               it->second));
         }
       }
       if (!preconditions.empty())
@@ -8051,15 +8233,13 @@ namespace Legion {
       // Lock was acquired by the caller
       reduce_args->proxy_this->reduce_open_children(reduce_args->child_color,
           update_mask, *reduce_args->children, done_events, 
-          false/*need lock*/, false/*local update*/);
+          true/*need lock*/, false/*local update*/);
       delete reduce_args->children;
-      // Release the lock before waiting
-      Runtime::release_reservation(reduce_args->state_lock);
       // Wait for all the effects to be applied
       if (!done_events.empty())
       {
         RtEvent done = Runtime::merge_events(done_events);
-        done.lg_wait();
+        done.wait();
       }
     }
 
@@ -8072,7 +8252,7 @@ namespace Legion {
       args.proxy_this = this;
       args.ref_kind = ref_kind;
       runtime->issue_runtime_meta_task(args, LG_LATENCY_WORK_PRIORITY,
-                                       NULL, done_event);
+                                       done_event);
     }
 
     //--------------------------------------------------------------------------
@@ -8646,7 +8826,7 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void InstanceRef::pack_reference(Serializer &rez, AddressSpaceID target)
+    void InstanceRef::pack_reference(Serializer &rez) const
     //--------------------------------------------------------------------------
     {
       rez.serialize(valid_fields);
@@ -8658,7 +8838,7 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void InstanceRef::unpack_reference(Runtime *runtime, TaskOp *task, 
+    void InstanceRef::unpack_reference(Runtime *runtime,
                                        Deserializer &derez, RtEvent &ready)
     //--------------------------------------------------------------------------
     {
@@ -9090,8 +9270,7 @@ namespace Legion {
     }
 
     //--------------------------------------------------------------------------
-    void InstanceSet::pack_references(Serializer &rez,
-                                      AddressSpaceID target) const
+    void InstanceSet::pack_references(Serializer &rez) const
     //--------------------------------------------------------------------------
     {
       if (single)
@@ -9102,19 +9281,19 @@ namespace Legion {
           return;
         }
         rez.serialize<size_t>(1);
-        refs.single->pack_reference(rez, target);
+        refs.single->pack_reference(rez);
       }
       else
       {
         rez.serialize<size_t>(refs.multi->vector.size());
         for (unsigned idx = 0; idx < refs.multi->vector.size(); idx++)
-          refs.multi->vector[idx].pack_reference(rez, target);
+          refs.multi->vector[idx].pack_reference(rez);
       }
     }
 
     //--------------------------------------------------------------------------
-    void InstanceSet::unpack_references(Runtime *runtime, TaskOp *task,
-                           Deserializer &derez, std::set<RtEvent> &ready_events)
+    void InstanceSet::unpack_references(Runtime *runtime, Deserializer &derez, 
+                                        std::set<RtEvent> &ready_events)
     //--------------------------------------------------------------------------
     {
       size_t num_refs;
@@ -9152,7 +9331,7 @@ namespace Legion {
           refs.single->add_reference();
         }
         RtEvent ready;
-        refs.single->unpack_reference(runtime, task, derez, ready);
+        refs.single->unpack_reference(runtime, derez, ready);
         if (ready.exists())
           ready_events.insert(ready);
       }
@@ -9174,7 +9353,7 @@ namespace Legion {
         for (unsigned idx = 0; idx < num_refs; idx++)
         {
           RtEvent ready;
-          refs.multi->vector[idx].unpack_reference(runtime, task, derez, ready);
+          refs.multi->vector[idx].unpack_reference(runtime, derez, ready);
           if (ready.exists())
             ready_events.insert(ready);
         }
